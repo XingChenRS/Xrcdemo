@@ -330,7 +330,8 @@ static void s_scrub_tick(void *self) {
 //     标它不是"跳过"是"吞指令"）。
 //   · 冻结看护：驻停期间冻结计数被扣减到 0 时当场补回并留痕——冻结与音频持有
 //     必须成对（谱面静止期间两者任何一方脱钩都会破坏音画一致）。
-typedef void (*s_pj_f7_t)(uint64_t note, uint64_t v);   /* slot7（vptr+56）：写 note+0x0C=W1 ——引擎快进 sub_1009204E4 的标记同槽同参 */
+typedef int  (*s_pj_f5_t)(uint64_t note);
+typedef void (*s_pj_f7_t)(uint64_t note, uint64_t v);
 
 static _Atomic(uint64_t) s_pj_ng    = 0;    // 已被施写 312 的 note 组
 static uint8_t           s_pj_saved = 0;    // 首见时的 312 原值
@@ -373,58 +374,15 @@ static void s_pause_pass_skip_tick(uint64_t ng, int32_t cur) {
         uint64_t vt = 0;
         memcpy(&vt, (void *)note, 8);
         if (!s_pj_ishp(vt)) continue;
-        uint64_t f7 = 0;
+        uint64_t f5 = 0, f7 = 0;
+        memcpy(&f5, (void *)(vt + 40), 8);
         memcpy(&f7, (void *)(vt + 56), 8);
-        if (!s_pj_isptr(f7)) continue;
+        if (!s_pj_isptr(f5) || !s_pj_isptr(f7)) continue;
         if (s_pj_is_scenecontrol(vt)) continue;
-        /* 放行门（2026-10-16 修正）：直接读**引擎守卫自己检查的两颗字节**——
-           slot8（vptr+0x40）读 +0x0C、slot6（vptr+0x30）读 +0x0D（vtable 逐表核验：
-           LogicTapNote/HoldNote/ArcNote/ArcTapNote 全表一致；两 pass 处理前要求两者皆 0）。
-           任一非 0 = 引擎已处理 ⇒ 不重标。
-           ⚠ 旧门读 slot5（vptr+40）系误用：该槽按类而异（tap/arctap = 「已判定」包装尚可；
-           **弧类 = isVoid 判定**——会把双倍弧整类漏标）。
-           ⚠ 已知边界：漏扫的 **LN 分支不查这两颗字节**（按分段表判定）——弧/长条即使标了
-           也可能被补处理，该支路留待专项。 */
-        uint8_t c0 = 0, c1 = 0;
-        memcpy(&c0, (void *)(note + 0x0C), 1);
-        memcpy(&c1, (void *)(note + 0x0D), 1);
-        if (c0 || c1) continue;
+        if (((s_pj_f5_t)f5)(note) & 1) continue;                      // 已消费：跳过
         ((s_pj_f7_t)f7)(note, 1);
         s_pj_marked++;
     }
-}
-
-// 恢复前诊断（只读，2026-10-16 C 轮；口径 = 引擎守卫自身）：
-//   数「已越过终点且 +0x0C/+0x0D 皆 0（引擎守卫判定 = 未处理）」的音符——松手后引擎两 pass
-//   将对它们逐个补处理（判定特效的来源清单）。另按 slot5 指针分辨弧类一档
-//   （弧走漏扫 LN 分支、守卫字节管不住，见 s_pause_pass_skip_tick 注释）。不做任何写。
-static int s_pause_count_unconsumed(uint64_t ng, int32_t cur, int *arc_out) {
-    uint64_t b = 0, e = 0;
-    memcpy(&b, (void *)(ng + 0xA0), 8);
-    memcpy(&e, (void *)(ng + 0xA8), 8);
-    if (!s_pj_ishp(b) || !s_pj_ishp(e) || e < b || (e - b) > 0x100000) return -1;
-    int n = 0;
-    for (uint64_t p = b; p < e; p += 8) {
-        uint64_t note = 0;
-        memcpy(&note, (void *)p, 8);
-        if (!s_pj_ishp(note)) continue;
-        int32_t te = 0;
-        memcpy(&te, (void *)(note + 0x1C), 4);
-        if (te == 0 || (int64_t)cur - (int64_t)te <= 100) continue;
-        uint64_t vt = 0;
-        memcpy(&vt, (void *)note, 8);
-        if (!s_pj_ishp(vt)) continue;
-        if (s_pj_is_scenecontrol(vt)) continue;
-        uint8_t c0 = 0, c1 = 0;
-        memcpy(&c0, (void *)(note + 0x0C), 1);
-        memcpy(&c1, (void *)(note + 0x0D), 1);
-        if (c0 || c1) continue;
-        n++;
-        uint64_t s5 = 0;
-        memcpy(&s5, (void *)(vt + 40), 8);
-        if (arc_out && s5 == g_xrc.image_base + 0x187C30ULL) (*arc_out)++;   // LogicArcNote slot5 = isVoid 判定
-    }
-    return n;
 }
 
 // 每帧（gp.update、note_group 有效、先于引擎 tick）：
@@ -467,12 +425,6 @@ static void s_pause_tick(void *ngp) {
             uint8_t g = *(uint8_t *)((char *)ng + XRC_NG_JUDGE_GATE_OFF);
             if (g & 1) *(uint8_t *)((char *)ng + XRC_NG_JUDGE_GATE_OFF) = s_pj_saved;
             xrc_logd(XRCLC_JUDGE, @"暂停护栏解除：判定总闸还原（路过跳过累计 %d）", s_pj_marked);
-            if (cur >= 0) {
-                int arcN = 0;
-                int nRes = s_pause_count_unconsumed(ng, cur, &arcN);
-                xrc_logi(XRCLC_JUDGE, @"[resume] 松手收口：越过未处理 %d 条（弧类 %d；跳过累计 %d）",
-                         nRes, arcN, s_pj_marked);
-            }
         }
     }
 }
