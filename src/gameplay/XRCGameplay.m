@@ -385,6 +385,34 @@ static void s_pause_pass_skip_tick(uint64_t ng, int32_t cur) {
     }
 }
 
+// 恢复前诊断（只读，2026-10-16 C 轮）：数一遍「已越过终点且尚未被 f5 消费」的音符。
+// 正常应≈0（路过跳过已覆盖）；>0 = 引擎在松手后的入场/漏扫会补处理这些音符
+//（"全屏爆判定特效"的候选来源）。只调 f5 只读消费位检查，不做任何写。
+static int s_pause_count_unconsumed(uint64_t ng, int32_t cur) {
+    uint64_t b = 0, e = 0;
+    memcpy(&b, (void *)(ng + 0xA0), 8);
+    memcpy(&e, (void *)(ng + 0xA8), 8);
+    if (!s_pj_ishp(b) || !s_pj_ishp(e) || e < b || (e - b) > 0x100000) return -1;
+    int n = 0;
+    for (uint64_t p = b; p < e; p += 8) {
+        uint64_t note = 0;
+        memcpy(&note, (void *)p, 8);
+        if (!s_pj_ishp(note)) continue;
+        int32_t te = 0;
+        memcpy(&te, (void *)(note + 0x1C), 4);
+        if (te == 0 || (int64_t)cur - (int64_t)te <= 100) continue;
+        uint64_t vt = 0, f5 = 0;
+        memcpy(&vt, (void *)note, 8);
+        if (!s_pj_ishp(vt)) continue;
+        memcpy(&f5, (void *)(vt + 40), 8);
+        if (!s_pj_isptr(f5)) continue;
+        if (s_pj_is_scenecontrol(vt)) continue;
+        if (((s_pj_f5_t)f5)(note) & 1) continue;
+        n++;
+    }
+    return n;
+}
+
 // 每帧（gp.update、note_group 有效、先于引擎 tick）：
 static void s_pause_tick(void *ngp) {
     uint64_t ng = (uint64_t)ngp;
@@ -425,6 +453,9 @@ static void s_pause_tick(void *ngp) {
             uint8_t g = *(uint8_t *)((char *)ng + XRC_NG_JUDGE_GATE_OFF);
             if (g & 1) *(uint8_t *)((char *)ng + XRC_NG_JUDGE_GATE_OFF) = s_pj_saved;
             xrc_logd(XRCLC_JUDGE, @"暂停护栏解除：判定总闸还原（路过跳过累计 %d）", s_pj_marked);
+            if (cur >= 0)
+                xrc_logi(XRCLC_JUDGE, @"[resume] 松手收口：越过未消费剩 %d 条（跳过累计 %d）",
+                         s_pause_count_unconsumed(ng, cur), s_pj_marked);
         }
     }
 }
