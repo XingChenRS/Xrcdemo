@@ -330,7 +330,8 @@ static void s_scrub_tick(void *self) {
 //     标它不是"跳过"是"吞指令"）。
 //   · 冻结看护：驻停期间冻结计数被扣减到 0 时当场补回并留痕——冻结与音频持有
 //     必须成对（谱面静止期间两者任何一方脱钩都会破坏音画一致）。
-typedef void (*s_pj_f7_t)(uint64_t note, uint64_t v);   /* slot7（vptr+56）：写 note+0x0C=W1 ——引擎快进 sub_1009204E4 的标记同槽同参 */
+typedef void (*s_pj_f7_t)(uint64_t note, uint64_t v);   /* slot7（vptr+56）：tap/arctap=写 +0x0C=W1；**弧=取值器、长条=恒返1空桩**（弧事件全链报告 2026-10-16） */
+typedef int  (*s_pj_ln_settle_t)(uint64_t note, int64_t at);   /* sub_10091E958：LN 真·结算（标段表 flag；n>0 写 +0x66）。边界按 64 位传（调用方读 W1/X1 均得同值） */
 
 static _Atomic(uint64_t) s_pj_ng    = 0;    // 已被施写 312 的 note 组
 static uint8_t           s_pj_saved = 0;    // 首见时的 312 原值
@@ -358,6 +359,103 @@ static bool s_pj_is_scenecontrol(uint64_t vt) {
     return strstr(buf, "SceneControl") != NULL;
 }
 
+/* ---- 弧事件（黑线/可点击弧、弧段、ArcTap、线上视觉、判定特效）全链修复骨架（2026-10-16）----
+   根事实（字节级取证）：
+   · 弧/长条**没有 +0x0C/+0x0D 写口**（slot7 对弧=取值器、对长条=空桩）——对它们调用 f7 = 静默空转；
+     其"已处理"的唯一表达＝**分段表 flag**（note+0x78..0x80，12B/段 {time,count,flag}；标满 ⇒
+     slot5(isVoid)=1 ⇒ 窗口 cull（sub_10091C47C）与整弧自藏（sub_1008A4514）同帧生效）。
+   · 未处理弧的渲染子树（含 park 在判定线上的头段光标/指示器快照）会一直逐帧 tick+绘制 = 回跳黑点。
+   · 松手瞬间漏扫 LN 分支按段表补结算：n 段记账（sub_100ACB880/B6A4）+ 1 次特效发布 = 爆特效；
+     弧子音符（arctap）另有 children 循环（门＝子 +0x0C==0&&+0x0D==0）逐子记账+发布 = 另一半。
+   修复 = **静默预结算**：把"引擎恢复瞬间本来就会做的结算"提前且不发特效地做掉——
+   与引擎逐位等价，不新造语义：
+   · 对越过未处理的弧(type0)/长条：调引擎自己的 sub_10091E958(note, te+500)（LOST 结算；
+     标全段表；n>0 时写 +0x66=0——同引擎；无记账/无事件/无特效）。⇒ 视觉残留与补判特效同源清零。
+   · 对弧子音符：走引擎同款标记 槽7(child,1)（LogicArcTapNote 槽7 实测=写 +0x0C=1）。黑线弧
+     (type≠0)的分段表由引擎自清（slot5 恒 1），但其 children 照爆——故子音符标记对全部弧型执行。
+   · 被跳过弧此后不再重入窗口＝引擎对已处理弧的既有行为（回拖不重显）。 */
+#define XRC_LN_VPTR_ARCTAP (0x14BBFB0ULL)   /* LogicArcTapNote 实例 vptr（vtable 扫描实证） */
+
+static _Atomic(uint32_t) s_pj_ln_total = 0;       /* 诊断：LN 预结算累计条数 */
+static _Atomic(uint32_t) s_pj_arctap_total = 0;   /* 诊断：弧子音符预标记累计条数 */
+
+// 段表是否已标满（= 弧的"已处理"；空表/形状异常视为已处理——slot5 同款语义，不碰）。只读。
+static bool s_pj_ln_table_full(uint64_t note) {
+    uint64_t sb = 0, se = 0;
+    memcpy(&sb, (void *)(note + 0x78), 8);
+    memcpy(&se, (void *)(note + 0x80), 8);
+    if (!s_pj_isptr(sb) || !s_pj_isptr(se) || se <= sb) return true;
+    if ((se - sb) % 12 != 0 || (se - sb) / 12 > 4096) return true;
+    for (uint64_t p = sb; p < se; p += 12) {
+        uint8_t flag = 0;
+        memcpy(&flag, (void *)(p + 8), 1);
+        if (!flag) return false;
+    }
+    return true;
+}
+
+// LN 预结算（仅 type0 弧与长条；追踪中不碰；段表形状校验后才调——E958 内有越界断言）。
+static bool s_pj_ln_presettle(uint64_t note, int32_t cur) {
+    uint64_t vt = 0;
+    memcpy(&vt, (void *)note, 8);
+    bool is_arc = (vt == g_xrc.image_base + XRC_LN_VPTR_ARC);
+    if (!is_arc && vt != g_xrc.image_base + XRC_LN_VPTR_HOLD) return false;
+    if (is_arc) {                                   // 引擎 LOST 路径同门：+0xA4==0（type0）
+        uint8_t a4 = 0;
+        memcpy(&a4, (void *)(note + 0xA4), 1);
+        if (a4 != 0) return false;
+    }
+    uint8_t held = 0;
+    memcpy(&held, (void *)(note + 0x64), 1);
+    if (held == 1) return false;                    // 追踪中（长条 hold / 弧被触）：不结算
+    if (s_pj_ln_table_full(note)) return false;     // 已标满：无事可做
+    uint64_t sb = 0, se = 0;
+    memcpy(&sb, (void *)(note + 0x78), 8);
+    memcpy(&se, (void *)(note + 0x80), 8);
+    if (!s_pj_isptr(sb) || !s_pj_isptr(se) || se <= sb) return false;
+    if ((se - sb) % 12 != 0 || (se - sb) / 12 > 4096) return false;
+    float seg = 0;
+    memcpy(&seg, (void *)(note + 0x70), 4);
+    if (!(seg > 0 && seg <= 10000)) return false;
+    int32_t te = 0;
+    memcpy(&te, (void *)(note + 0x1C), 4);
+    if (te == 0) return false;
+    ((s_pj_ln_settle_t)(g_xrc.image_base + 0x91E958ULL))((uint64_t)note, te + 500);
+    (void)cur;                                      // 边界取 te+500（≥全部段时刻）＝标全表
+    atomic_fetch_add(&s_pj_ln_total, 1);
+    return true;
+}
+
+// 弧子音符（arctap）预标记：干的是引擎 children 循环同一件事（槽7 写 +0x0C=1），
+// 但只标不记账不发布——松手后 children 循环的门（子 +0x0C/+0x0D 皆 0）即失效。
+static void s_pj_arctap_mark_children(uint64_t note, int32_t cur) {
+    uint64_t cb = 0, ce = 0;
+    memcpy(&cb, (void *)(note + 0x120), 8);
+    memcpy(&ce, (void *)(note + 0x128), 8);
+    if (!s_pj_ishp(cb) || !s_pj_ishp(ce) || ce < cb || (ce - cb) > 0x4000) return;
+    uint64_t mb = g_xrc.image_base;
+    for (uint64_t p = cb; p < ce; p += 8) {
+        uint64_t child = 0;
+        memcpy(&child, (void *)p, 8);
+        if (!s_pj_ishp(child)) continue;
+        uint64_t cv = 0;
+        memcpy(&cv, (void *)child, 8);
+        if (cv != mb + XRC_LN_VPTR_ARCTAP) continue;
+        uint8_t c0 = 0, c1 = 0;
+        memcpy(&c0, (void *)(child + 0x0C), 1);
+        memcpy(&c1, (void *)(child + 0x0D), 1);
+        if (c0 || c1) continue;
+        int32_t ct = 0;
+        memcpy(&ct, (void *)(child + 0x1C), 4);
+        if (ct == 0 || (int64_t)cur - (int64_t)ct <= 100) continue;
+        uint64_t f7c = 0;
+        memcpy(&f7c, (void *)(cv + 56), 8);
+        if (!s_pj_isptr(f7c)) continue;
+        ((s_pj_f7_t)f7c)(child, 1);
+        atomic_fetch_add(&s_pj_arctap_total, 1);
+    }
+}
+
 static void s_pause_pass_skip_tick(uint64_t ng, int32_t cur) {
     uint64_t b = 0, e = 0;
     memcpy(&b, (void *)(ng + 0xA0), 8);   // 活动窗口（与 XRCReplay 的 RPF_VEC_BEGIN 同源）
@@ -373,10 +471,19 @@ static void s_pause_pass_skip_tick(uint64_t ng, int32_t cur) {
         uint64_t vt = 0;
         memcpy(&vt, (void *)note, 8);
         if (!s_pj_ishp(vt)) continue;
+        if (s_pj_is_scenecontrol(vt)) continue;
+        /* 弧事件整体口径（2026-10-16）：弧/长条走"静默预结算"（段表＋子音符），
+           其余（tap 族）走引擎快进同款的 +0x0C 标记。两支互补，不互斥。 */
+        if (vt == g_xrc.image_base + XRC_LN_VPTR_ARC ||
+            vt == g_xrc.image_base + XRC_LN_VPTR_HOLD) {
+            s_pj_ln_presettle(note, cur);
+            if (vt == g_xrc.image_base + XRC_LN_VPTR_ARC)
+                s_pj_arctap_mark_children(note, cur);   // 黑线弧也执行（其 children 照爆）
+            continue;
+        }
         uint64_t f7 = 0;
         memcpy(&f7, (void *)(vt + 56), 8);
         if (!s_pj_isptr(f7)) continue;
-        if (s_pj_is_scenecontrol(vt)) continue;
         /* 放行门（2026-10-16 修正）：直接读**引擎守卫自己检查的两颗字节**——
            slot8（vptr+0x40）读 +0x0C、slot6（vptr+0x30）读 +0x0D（vtable 逐表核验：
            LogicTapNote/HoldNote/ArcNote/ArcTapNote 全表一致；两 pass 处理前要求两者皆 0）。
@@ -415,14 +522,21 @@ static int s_pause_count_unconsumed(uint64_t ng, int32_t cur, int *arc_out) {
         memcpy(&vt, (void *)note, 8);
         if (!s_pj_ishp(vt)) continue;
         if (s_pj_is_scenecontrol(vt)) continue;
+        /* 口径 = 各类自身的"引擎结算表达式"：tap 族＝守卫两字节；弧/长条＝段表是否标满
+           （弧没有 +0x0C/+0x0D 写口，结算走分段表——2026-10-16 弧事件全链报告）。 */
+        bool is_arc = (vt == g_xrc.image_base + XRC_LN_VPTR_ARC);
+        if (is_arc || vt == g_xrc.image_base + XRC_LN_VPTR_HOLD) {
+            if (!s_pj_ln_table_full(note)) {
+                n++;
+                if (arc_out && is_arc) (*arc_out)++;
+            }
+            continue;
+        }
         uint8_t c0 = 0, c1 = 0;
         memcpy(&c0, (void *)(note + 0x0C), 1);
         memcpy(&c1, (void *)(note + 0x0D), 1);
         if (c0 || c1) continue;
         n++;
-        uint64_t s5 = 0;
-        memcpy(&s5, (void *)(vt + 40), 8);
-        if (arc_out && s5 == g_xrc.image_base + 0x187C30ULL) (*arc_out)++;   // LogicArcNote slot5 = isVoid 判定
     }
     return n;
 }
@@ -470,8 +584,9 @@ static void s_pause_tick(void *ngp) {
             if (cur >= 0) {
                 int arcN = 0;
                 int nRes = s_pause_count_unconsumed(ng, cur, &arcN);
-                xrc_logi(XRCLC_JUDGE, @"[resume] 松手收口：越过未处理 %d 条（弧类 %d；跳过累计 %d）",
-                         nRes, arcN, s_pj_marked);
+                xrc_logi(XRCLC_JUDGE, @"[resume] 松手收口：越过未处理 %d 条（弧类 %d）｜LN 预结算累计 %u、子音符预标记累计 %u、tap 跳过累计 %d",
+                         nRes, arcN,
+                         atomic_load(&s_pj_ln_total), atomic_load(&s_pj_arctap_total), s_pj_marked);
             }
         }
     }
