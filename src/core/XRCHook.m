@@ -316,22 +316,32 @@ static void s_cb_fetch_observe(void *vctx) {
 // ⚠ 极性（2026-10-16 修正，四组指令级锚点见 XRCProfile.h 同名块）：**1 = 锁、0 = 可玩**。
 //   早前"全 1 = 全解"是把 919E5C「未声明难度→0x0101010101 早退」误读为"全解锁"所致；
 //   直返 0x0101010101 实为"五难度全锁死"（真机现象：锁标曲绘 + 标题"???"）。
-//   现直返 0 = 普通歌曲的原生"干净"值。b4(=bit32) 同时是锁绘触发器：0 时不再触发锁绘，
+//   现直返 (0,0) = 普通歌曲的原生"干净"返回值。b4(=bit32) 同时是锁绘触发器：0 时不再触发锁绘，
 //   旧"专属曲绘与挂锁不可兼得"的取舍随之作废。
+// 锁态直返 (0,0)：x1 是原生"额外锁定原因"第二返回值——门控放行分支 @0x991530/34
+// （MOV X9,#0；MOV X1,#0）同清两值（2026-10-16 复核）。注意 x1 在入口是难度实参，
+// 只清 x0 会把"难度序数"当锁定原因漏给调用方。
+static void s_lock_clear(void *vctx) {
+    ucontext_t *uc = (ucontext_t *)vctx;
+    if (!uc || !uc->uc_mcontext) return;
+    uc->uc_mcontext->__ss.__x[1] = 0;
+    s_ret(0, vctx);
+}
 static void s_lock_fv(void *vctx) {
     if (!atomic_load(&s_unlock_fv)) return;
-    s_ret(0, vctx);
+    s_lock_clear(vctx);
 }
 static void s_lock_do(void *vctx) {
     if (!atomic_load(&s_unlock_do)) return;
-    s_ret(0, vctx);
+    s_lock_clear(vctx);
 }
 
 // 终章链门覆盖（开关 gateOpen）：
 // `sub_10099156C` 的返回语义经两处消费点钉死——
 //   ① `sub_100919874`（可玩性谓词）直返它的值，消费点 sub_1008660F8 的 `CBNZ W0`（选中该难度）
 //      把非零当"可用"；
-//   ② `sub_100991508` 里 `if (56C & 1) → 返回全 0 字节（全锁）`，方向一致。
+//   ② `sub_100991508` 里 `if (56C & 1) → 返回全 0 字节（全解锁）`——与锁态字节方向相反
+//      （门控 1 = 放行；锁态 0 = 解锁），2026-10-16 极性修正时一并订正。
 //   ⇒ **1 = 放行、0 = 锁**（返 0 会把全曲钉死）；入口直返 **1**。
 static void s_finale_gate_open(void *vctx) {
     if (!atomic_load(&s_gate_open)) return;
@@ -577,9 +587,17 @@ static void s_ap_arc_visual(void *vctx) {
 //   ③ sub_100BDC5A8 / sub_100BDC8D4 难度条件求值（解锁条件对象家族）→ 恒真（1）。
 //   ④ sub_100850308 下载"需动作"谓词（仅 2 调用点：start 钮图标/开局弹窗分流）→ 直返 0。
 //      ⚠ 不动 sub_100844774（下载机制本体，2026-09-28 教训）；缺文件仍由开局链温和失败+重扫。
-static void s_lock_all(void *vctx) {           // lock_fv/lock_do 同款直返；总源级覆盖
+static void s_lock_all(void *vctx) {           // 已声明难度解锁（直返 (0,0)）；未声明难度保留原判定
     if (!atomic_load(&s_unlock_all)) return;
-    s_ret(0, vctx);                            // 0 = 原生"干净歌曲"值（全难度可玩）；极性见上方注释块
+    ucontext_t *uc = (ucontext_t *)vctx;
+    if (!uc || !uc->uc_mcontext) return;
+    __typeof__(uc->uc_mcontext->__ss) *ss = &uc->uc_mcontext->__ss;
+    uint64_t song = ss->__x[0];
+    uint32_t diff = (uint32_t)ss->__x[1];
+    if (!s_ap_ptr_ok(song)) return;                    // 指针防御：异常形态空转回放原逻辑
+    uint32_t idx = diff >= 5 ? 1 : diff;               // = sub_100BDCD20（≥5 归 1；0x84CE2C 内同式）
+    if (s_ap_ld8(song + 0x250 + idx) == 0) return;     // 该难度未声明（本地无谱面）：不硬开、保留锁定
+    s_lock_clear(vctx);
 }
 
 static void s_play_gate(void *vctx) {          // 可玩性总源：声明过难度 → 恒放行

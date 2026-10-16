@@ -75,6 +75,40 @@ int xrc_store_install(void) {
                 xrc_logi(XRCLC_CB, @"[store] cb 已外置 → %@", dst);
                 return 1;
             }
+            // 侧载覆盖可能更换数据容器 UUID：旧容器的绝对软链必然失效，须原子重建
+            //（否则游戏写 meta.cb 时 fopen 失败）。只接管"我们自己建的"链
+            //（指向某容器 Documents/cb）；用户自建的外来链仍不碰。
+            BOOL ours = [t containsString:@"/Containers/Data/Application/"] &&
+                        [t hasSuffix:@"/Documents/cb"];
+            if (ours) {
+                if (s_lstat(cdst, &m) != 0) {
+                    NSError *err = nil;
+                    if (![[NSFileManager defaultManager] createDirectoryAtPath:dst
+                                                   withIntermediateDirectories:YES
+                                                                    attributes:nil
+                                                                         error:&err]) {
+                        xrc_loge(XRCLC_CB, @"[store] 迁移后建 %@ 失败: %@", dst, err);
+                        return -1;
+                    }
+                } else if (!S_ISDIR(m)) {
+                    xrc_loge(XRCLC_CB, @"[store] 迁移后的 %@ 不是目录", dst);
+                    return -1;
+                }
+                NSString *tmp = [src stringByAppendingFormat:@".xrc-relink-%@", [NSUUID UUID].UUIDString];
+                const char *ctmp = tmp.fileSystemRepresentation;
+                if (symlink(cdst, ctmp) != 0) {
+                    xrc_loge(XRCLC_CB, @"[store] 新 cb 软链创建失败: %s", strerror(errno));
+                    return -1;
+                }
+                if (rename(ctmp, csrc) != 0) {
+                    int saved = errno;
+                    unlink(ctmp);
+                    xrc_loge(XRCLC_CB, @"[store] cb 软链更新失败: %s", strerror(saved));
+                    return -1;
+                }
+                xrc_logi(XRCLC_CB, @"[store] 容器迁移后 cb 软链已修复：%@ → %@", t, dst);
+                return 0;
+            }
             xrc_logw(XRCLC_CB, @"[store] cb 是软链但指向 %@（期望 %@），不动它", t, dst);
             return 1;
         }
