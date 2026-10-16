@@ -1033,6 +1033,139 @@ static void rpf_rebuild_dispatch(uint64_t scene, int n) {
     dispatch_async_f(dispatch_get_main_queue(), j, rpf_rebuild_main);
 }
 
+// ---------------------------------------------------------------- ArcTap 残留黑点处置（2026-10-16 B 轮）
+// 机制（指令级取证，全链证据见 research/notes/xrc-plan-2026-10-16-pr2-adoption-blackdot-preview.md）：
+//   RenderArcTapNote::tick(sub_1008A4284) 每帧无条件执行：主贴图 opacity = f(pos)（pos≤-9000 ⇒ 0）；
+//   本节点 setVisible(1)；阴影 setVisible(1)；**阴影 opacity = v2 × *(u8)(tap+0x29B)**（基值 70/100）。
+//   ⇒「子音符未判定(+0x0D=0) 且未跳过(+0x0C=0) 且已越过(pos≤-9000)」的 ArcTap 残留 =
+//   主贴图透明 + 阴影仍亮 = 判定线黑点。回跳是产生这类"被越过但未再消费"子音符的唯一场景；
+//   二次判定写 +0x0D 后 tick 首分支整体隐藏 ⇒ 消失（与实机"仅回跳出现、二次判定后消失"吻合）。
+//   ⇒ 一次性 setVisible(0) 会被同帧 tick 的复显分支抵消（含此前 sweep 失败的原因）；
+//   **唯一持久杠杆 = tap+0x29B 置 0**——tick 每帧读它算阴影透明度，一次写入跨帧生效；
+//   主贴图重新可见（重播再接近）时回写原值即可完全恢复。
+// 布局（全部字节直读核验）：tap 实例 vptr=+0x14B03E8；+0x268 子音符 / +0x288 主 sprite /
+//   +0x290 阴影 sprite / +0x29B 阴影基不透明度；子音符 +0x0C 跳过 / +0x0D 判定 / +0x30 pos(i32) /
+//   +0x40 回指渲染对象（工厂写入，身份校验用）；弧渲染 vptr=+0x14E9108、ArcTap 向量 +0x2A8/+0x2B0；
+//   主 sprite vptr=+0x1535A48、阴影 sprite vptr=+0x1497700（颜色/混合模式见笔记"未决项"）。
+// 线程纪律：写侧 = rpf_reset_main（主队列，与重置同拍）；恢复扫 = 常驻线程探测到表非空后
+//   派发主队列（幂等 job、静态 ctx）。表只在主队列读写；常驻线程只原子读计数。
+#define XRC_RT_TAP_VPTR     (0x14B03E8ULL)
+#define XRC_RT_ARC_VPTR     (0x14E9108ULL)
+#define XRC_RT_MAIN_VPTR    (0x1535A48ULL)
+#define XRC_RT_SHADOW_VPTR  (0x1497700ULL)
+#define XRC_RT_T_SUB        (0x268ULL)
+#define XRC_RT_T_MAIN       (0x288ULL)
+#define XRC_RT_T_SHADOW     (0x290ULL)
+#define XRC_RT_T_BASEOP     (0x29BULL)
+#define XRC_RT_SUB_SKIP     (0x0CULL)
+#define XRC_RT_SUB_JUDGE    (0x0DULL)
+#define XRC_RT_SUB_POS      (0x30ULL)
+#define XRC_RT_SUB_RENDER   (0x40ULL)
+#define XRC_RT_ARC_TAPS_B   (0x2A8ULL)
+#define XRC_RT_ARC_TAPS_E   (0x2B0ULL)
+#define XRC_RT_FIX_MAX      64
+
+typedef struct { uint64_t tap; uint8_t saved; } rpf_tapfix_t;
+static rpf_tapfix_t s_tapfix[XRC_RT_FIX_MAX];
+static _Atomic(int) s_tapfix_n = 0;           /* 仅主队列写；常驻线程只原子读 */
+static _Atomic(uint32_t) s_tapfix_total = 0;  /* 诊断累计 */
+
+// 身份校验：vptr 精确匹配 + 子音符回指（挡旧对象/内存复用/跨场景残留）。
+static bool rpf_rt_valid(uint64_t tap, uint64_t *sub_out) {
+    uint64_t vt = 0;
+    if (!s_ishp(tap) || !rd(tap, &vt, 8) || vt != g_xrc.image_base + XRC_RT_TAP_VPTR) return false;
+    uint64_t sub = 0;
+    if (!rd(tap + XRC_RT_T_SUB, &sub, 8) || !s_ishp(sub)) return false;
+    if (rd64(sub + XRC_RT_SUB_RENDER) != tap) return false;    // 回指校验（工厂写入）
+    uint64_t main_p = rd64(tap + XRC_RT_T_MAIN), sh = rd64(tap + XRC_RT_T_SHADOW);
+    if (!s_ishp(main_p) || !s_ishp(sh)) return false;
+    if (rd64(main_p) != g_xrc.image_base + XRC_RT_MAIN_VPTR) return false;
+    if (rd64(sh) != g_xrc.image_base + XRC_RT_SHADOW_VPTR) return false;
+    if (sub_out) *sub_out = sub;
+    return true;
+}
+
+static bool rpf_rt_is_residue(uint64_t tap) {
+    uint64_t sub = 0;
+    if (!rpf_rt_valid(tap, &sub)) return false;
+    if (rd8(sub + XRC_RT_SUB_SKIP) || rd8(sub + XRC_RT_SUB_JUDGE)) return false;  // 已消费
+    int32_t pos = 0;
+    if (!rd(sub + XRC_RT_SUB_POS, &pos, 4)) return false;
+    return pos <= -9000;    // 已越过（与 tick 主贴图淡出阈值同源；position 为原生数值非毫秒）
+}
+
+// 写侧（主队列，回跳重置收口时）：残留 ArcTap 的阴影基不透明度置 0（记录原值待恢复）。
+static void rpf_arctap_residue_pass(uint64_t scene) {
+    if (!scene) return;
+    uint64_t mgr = rd64(scene + RPF_RENDERMGR);
+    if (!s_ishp(mgr)) return;
+    uint64_t rb = rd64(mgr + RPF_RM_REG_BEGIN), re = rd64(mgr + RPF_RM_REG_END);
+    if (!s_ishp(rb) || !s_ishp(re) || re < rb || (re - rb) > 0x100000) return;
+    int fixed = 0;
+    for (uint64_t p = rb; p < re; p += 8) {
+        uint64_t rn = rd64(p);
+        if (!s_ishp(rn) || rd64(rn) != g_xrc.image_base + XRC_RT_ARC_VPTR) continue;   // 只走弧体渲染对象
+        uint64_t tb = rd64(rn + XRC_RT_ARC_TAPS_B), te = rd64(rn + XRC_RT_ARC_TAPS_E);
+        if (!s_ishp(tb) || !s_ishp(te) || te < tb || (te - tb) > 0x4000) continue;
+        for (uint64_t q = tb; q < te; q += 8) {
+            uint64_t tap = rd64(q);
+            if (!rpf_rt_is_residue(tap)) continue;
+            int n = atomic_load(&s_tapfix_n), dup = 0;
+            for (int i = 0; i < n; i++) if (s_tapfix[i].tap == tap) { dup = 1; break; }
+            if (dup) continue;
+            uint8_t cur = rd8(tap + XRC_RT_T_BASEOP);
+            if (cur == 0) continue;        // 已是 0：不记（防把"恢复值"记成 0）
+            if (n >= XRC_RT_FIX_MAX) continue;   // 表满：跳过（末尾告警）
+            s_tapfix[n].tap = tap;
+            s_tapfix[n].saved = cur;
+            atomic_store(&s_tapfix_n, n + 1);
+            wr8(tap + XRC_RT_T_BASEOP, 0);
+            atomic_fetch_add(&s_tapfix_total, 1);
+            fixed++;
+        }
+    }
+    if (fixed)
+        xrc_logi(XRCLC_JUDGE, @"[rpf] arctap 残留处置：本次 %d 条（累计 %u，表 %d）",
+                 fixed, atomic_load(&s_tapfix_total), atomic_load(&s_tapfix_n));
+    if (atomic_load(&s_tapfix_n) >= XRC_RT_FIX_MAX)
+        xrc_logw(XRCLC_JUDGE, @"[rpf] arctap 处置表已满（%d）——后续残留本轮不处置", XRC_RT_FIX_MAX);
+}
+
+// 恢复侧（主队列，常驻线程按需派发）：主贴图重新可见或对象死亡 ⇒ 回写原基值 / 剔除。
+static void rpf_arctap_restore_sweep(void) {
+    int n = atomic_load(&s_tapfix_n);
+    if (n <= 0) return;
+    int w = 0, restored = 0;
+    for (int i = 0; i < n; i++) {
+        rpf_tapfix_t e = s_tapfix[i];
+        if (!rpf_rt_valid(e.tap, NULL)) continue;                 // 对象已亡：剔除
+        uint64_t main_p = rd64(e.tap + XRC_RT_T_MAIN);
+        if (!s_ishp(main_p)) { s_tapfix[w++] = e; continue; }
+        uint8_t op = rd8(main_p + 0x1D1);                          // Node 显示不透明度（getOpacity 读它）
+        if (op != 0) {                                             // 主贴图可见：恢复阴影基值
+            wr8(e.tap + XRC_RT_T_BASEOP, e.saved);
+            restored++;
+            continue;
+        }
+        s_tapfix[w++] = e;                                         // 主仍透明（残留未解）：保留
+    }
+    atomic_store(&s_tapfix_n, w);
+    if (restored)
+        xrc_logd(XRCLC_JUDGE, @"[rpf] arctap 阴影基值恢复：%d 条（表余 %d）", restored, w);
+}
+
+static _Atomic(int) s_tapfix_sweep_pend = 0;
+static void rpf_arctap_restore_job(void *ctx) {
+    (void)ctx;
+    atomic_store(&s_tapfix_sweep_pend, 0);
+    rpf_arctap_restore_sweep();
+}
+static void rpf_arctap_restore_dispatch(void) {
+    if (atomic_exchange(&s_tapfix_sweep_pend, 1)) return;   // 已有在途，去重
+    static int s_ctx;                                        // 幂等 job：共享静态 ctx 安全
+    dispatch_async_f(dispatch_get_main_queue(), &s_ctx, rpf_arctap_restore_job);
+}
+
 // ---- 清洗的取数来源 = 现场扫引擎的活结构 ----
 // 依据：三个症状（弧超界 / 弧缺段 / 幽灵 hold）都指向同一件事 —— 某条音符的窗口进出时机或
 // 触摸态被改错了。指针快照（最长 1 秒前的 s_reg[]）有两个易错点：
@@ -1500,6 +1633,9 @@ static void rpf_reset_main(void *ctx) {
     if (!j) return;
     rpf_ap_latch_reset();          /* 先清闩，再走清洗/复活/重建 */
     rpf_reset(j->ng, j->T, j->P);
+    /* ArcTap 残留黑点处置（主队列、与重置同拍；只读+单字节视觉写，遵 s_do_write 纪律）。
+       见本文件"ArcTap 残留黑点处置"块。 */
+    if (s_do_write) rpf_arctap_residue_pass(xrc_gameplay_instance());
     /* 冻结窗收口。常规路径由**重建任务末尾**收口（它是链上最后一棒）；
        这里只兜「本帧不会有后续任务」的情形（重建未派发 且 复活也未派发）。 */
     {
@@ -1682,6 +1818,9 @@ static void *rpf_thread(void *arg) {
     for (;;) {
         usleep(RPF_TICK_MS * 1000);
         rpf_fast_tick();
+        /* 残留处置表的恢复扫（主贴图重新可见/对象死亡 ⇒ 回写或剔除）。
+           表非空才派发；job 幂等、在途去重。 */
+        if (atomic_load(&s_tapfix_n) > 0) rpf_arctap_restore_dispatch();
     }
     return NULL;   /* 不可达 */
 }
