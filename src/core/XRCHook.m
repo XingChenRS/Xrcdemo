@@ -185,7 +185,7 @@ static void s_ret(uint64_t val, void *vctx) {
 //   own  → unlock_l1/l2/l3（拥有链；覆盖"服务器未授予、本地已有内容"的离线场景）
 //   fv   → lock_fv（FV 五曲 fast path → 五难度全解）
 //   do   → lock_do（DO/konzetsu 分支 → 同上）
-//   gate → fv_gate（终章链门；**1 = 放行**，决定整表是否解锁）
+//   gate → fv_gate + pack_open（终章链门 / 包状态机；gate 族放行档：链门 1=放行、包 3=已拥有）
 //   all  → lock_all/play_gate/cond_unlock_*（全条件放行：锁态/可玩性/条件判定源头恒真；
 //          另与 do 联动旁路锁绘族（含 arghena 专属曲绘）——见 s_jacket_branch）
 //   dl   → dl_play（下载"需动作"谓词恒 0：开局不转"Download song?"弹窗；文件存在性开局链亲验）
@@ -312,19 +312,19 @@ static void s_cb_fetch_observe(void *vctx) {
 // 锁状态函数 `sub_100919E5C` 内的两个专属子分支（各自唯一调用方 = 锁态函数自身）：
 //   · 0x100991508 = FV 五曲 fast path（硬编码集合经 song+0x257 开关；id 改名后该路不再命中）；
 //   · 0x100AAE50C = DO(konzetsu) 分支（读存档 insightPrechallengeRevealIndex；未推进时只放行 FTR/INS）。
-// 二者都返回"五字节打包"的按难度解锁位（b0..b4 = PST/PRS/FTR/BYD/INS，**1 = 可玩**）→
-// 直返 `0x0101010101` = 五难度全解。
-// ⚠ DO 专属曲绘与 b4 的冲突（实测）：`sub_10084EE7C` 里"包==konzetsu 且锁态 b4 置位
-//   → 用 img/jacket_locked_konzetsu.jpg"。五字节全置 1 会让 DO 曲显示那张专属曲绘（**是曲绘、
-//   不是挂锁**，可玩性不受影响）；反之让 b4=0 保普通曲绘，则 cell 的"全 1 才算解锁"判据失败 →
-//   挂锁回来。二者共用 b4，**不可兼得**，现取"无挂锁 + 专属曲绘"。
+// 二者都返回"五字节打包"的按难度锁态（b0..b4 = PST/PRS/FTR/BYD/INS）。
+// ⚠ 极性（2026-10-16 修正，四组指令级锚点见 XRCProfile.h 同名块）：**1 = 锁、0 = 可玩**。
+//   早前"全 1 = 全解"是把 919E5C「未声明难度→0x0101010101 早退」误读为"全解锁"所致；
+//   直返 0x0101010101 实为"五难度全锁死"（真机现象：锁标曲绘 + 标题"???"）。
+//   现直返 0 = 普通歌曲的原生"干净"值。b4(=bit32) 同时是锁绘触发器：0 时不再触发锁绘，
+//   旧"专属曲绘与挂锁不可兼得"的取舍随之作废。
 static void s_lock_fv(void *vctx) {
     if (!atomic_load(&s_unlock_fv)) return;
-    s_ret(0x0000000101010101ULL, vctx);
+    s_ret(0, vctx);
 }
 static void s_lock_do(void *vctx) {
     if (!atomic_load(&s_unlock_do)) return;
-    s_ret(0x0000000101010101ULL, vctx);
+    s_ret(0, vctx);
 }
 
 // 终章链门覆盖（开关 gateOpen）：
@@ -336,6 +336,14 @@ static void s_lock_do(void *vctx) {
 static void s_finale_gate_open(void *vctx) {
     if (!atomic_load(&s_gate_open)) return;
     s_ret(1, vctx);
+}
+
+// 包状态机覆盖（开关 gateOpen，面板处已 ||unlockAll）：sub_100CD0108 恒返 3（= 已拥有）。
+// 语义：包状态 1 = 不可进（FV 包弹「Complete 'Black Fate' and see VS-8…」/ 封面 pack_inaccessible /
+//   歌列表跳过），2/3 = 可进（3 = 已拥有）。站点与证据见 XRCProfile.h 同名块（2026-10-16 专项）。
+static void s_pack_open(void *vctx) {
+    if (!atomic_load(&s_gate_open)) return;
+    s_ret(3, vctx);
 }
 
 // 链进度覆盖：`sub_10098FB1C` 是 7.0 新增「链」系统的查表点——硬编码曲名（InitFunc_194 表）
@@ -557,7 +565,7 @@ static void s_ap_arc_visual(void *vctx) {
 //      ⚠ 不动 sub_100844774（下载机制本体，2026-09-28 教训）；缺文件仍由开局链温和失败+重扫。
 static void s_lock_all(void *vctx) {           // lock_fv/lock_do 同款直返；总源级覆盖
     if (!atomic_load(&s_unlock_all)) return;
-    s_ret(0x0000000101010101ULL, vctx);
+    s_ret(0, vctx);                            // 0 = 原生"干净歌曲"值（全难度可玩）；极性见上方注释块
 }
 
 static void s_play_gate(void *vctx) {          // 可玩性总源：声明过难度 → 恒放行
@@ -584,10 +592,10 @@ static void s_dl_play_ready(void *vctx) {      // "需要下载/更新"谓词 �
 }
 
 // 锁绘分支族（四处，站点/出处见 XRCProfile.h 同名块）：
-//   触发器 = 锁态打包值 bit32（b4/INS）置位 → 走 sub_10084F0E8 锁绘选择器
-//   （包 konzetsu/finale → jacket_locked_*；arghena→konzetsu 绘；其余 → jacket_locked_generic）。
-//   ⚠ 该位与"五难度全解"共用（unlockDo/unlockAll 置 b4=1 ⇒ 原本该显示锁绘的曲目锁绘状态被
-//   固化成"所有曲都触发"）→ 开关开时恒走普通曲绘侧：TBNZ 站点→不跳；TBZ 站点（B3F274）→跳。
+//   触发器 = 锁态打包值 bit32 置位（**该位是"锁定"标志之一**；极性修正后见 XRCProfile.h）。
+//   置位 → 走 sub_10084F0E8 锁绘选择器（包 konzetsu/finale → jacket_locked_*；arghena→konzetsu 绘；
+//   其余 → jacket_locked_generic）。锁态桩现值 0 ⇒ bit32=0，本族与原生同侧（冗余保险）；
+//   开关开时恒走普通曲绘侧：TBNZ 站点→不跳；TBZ 站点（B3F274）→跳。
 //   开关关 → 按位复现原分支（逐字节同原行为）。均为 PC 相对条件分支：replay=0（no-replay）。
 static void s_jacket_branch(void *vctx, int reg, uint64_t target_off, bool tbz) {
     ucontext_t *uc = (ucontext_t *)vctx;
@@ -844,6 +852,7 @@ static const xrc_brk_entry_t k_brk_entries[] = {
     { "lock_fv",          XRC_BRK_LOCK_FV_SITE_OFF,         XRC_BRK_LOCK_FV_REPLAY_OFF,         s_lock_fv },
     { "lock_do",          XRC_BRK_LOCK_DO_SITE_OFF,         XRC_BRK_LOCK_DO_REPLAY_OFF,         s_lock_do },
     { "fv_gate",          XRC_BRK_FV_GATE_SITE_OFF,         XRC_BRK_FV_GATE_REPLAY_OFF,         s_finale_gate_open },
+    { "pack_open",        XRC_BRK_PACK_OPEN_SITE_OFF,       XRC_BRK_PACK_OPEN_REPLAY_OFF,       s_pack_open },
     { "chain_prog",       XRC_BRK_CHAIN_PROG_SITE_OFF,      XRC_BRK_CHAIN_PROG_REPLAY_OFF,      s_chain_prog_neutral },
     // ---- 全条件放行（unlock_all / dl_ready；站点/出处见 XRCProfile.h 同名块）----
     { "lock_all",         XRC_BRK_LOCK_ALL_SITE_OFF,        XRC_BRK_LOCK_ALL_REPLAY_OFF,        s_lock_all },
@@ -1021,7 +1030,7 @@ static const xrc_static_patch_t k_static_patches[] = {
 typedef struct { const char *feature; const char *sites[10]; int n; } xrc_feature_sites_t;
 static const xrc_feature_sites_t k_feature_sites[] = {
     { "unlock_own",     { "unlock_l1", "unlock_l2", "unlock_l3" }, 3 },
-    { "unlock_lock",    { "lock_fv", "lock_do", "fv_gate" }, 3 },
+    { "unlock_lock",    { "lock_fv", "lock_do", "fv_gate", "pack_open" }, 4 },
     { "chain_guard",    { "chain_prog" }, 1 },
     { "unlock_all",     { "lock_all", "play_gate", "cond_unlock_a", "cond_unlock_b",
                           "jacket_lock", "jacket_cell", "jacket_info", "jacket_panel" }, 8 },
@@ -1137,9 +1146,10 @@ void xrc_brk_setup(uint64_t image_base) {
     // 配对标记 ②：链进度覆盖桩（chain_prog，7.0 新增「链」系统的查表点）由本 dylib 处理；
     // 旧 dylib 命中该站点会重放原指令 → 崩因依旧，注入脚本据此拒配。此桩**不设开关、恒生效**。
     xrc_logi(XRCLC_BOOT, @"[brk] chain-guard v1 ready (chain_prog -> 100, always-on)");
-    // 配对标记 ③：全条件放行族（lock_all/play_gate/cond_unlock_*/jacket_*/dl_play）。
+    // 配对标记 ③：全条件放行族（lock_all/play_gate/cond_unlock_*/jacket_*/dl_play/pack_open）。
     // jacket_* 是 no-replay 条件分支桩（旧 dylib 无处理器时落兜底/默认陷阱）→ 注入脚本据此拒配。
-    xrc_logi(XRCLC_BOOT, @"[brk] unlock-policy v1 ready (lock_all/play_gate/cond_unlock/jacket_* -> unlockAll; dl_play -> dlReady)");
+    // v1→v2（2026-10-16）：新增 pack_open（包状态机）；旧 dylib 无该处理器 ⇒ 标记换代，注入脚本拒配。
+    xrc_logi(XRCLC_BOOT, @"[brk] unlock-policy v2 ready (lock_all/play_gate/cond_unlock/jacket_* -> unlockAll; dl_play -> dlReady; pack_open -> gateOpen)");
     // 开关组（策略/plist 驱动）
     xrc_logi(XRCLC_BOOT, @"[brk] switches: own=%d fv=%d do=%d gate=%d all=%d dl=%d (slots=%d)",
             (int)atomic_load(&s_unlock_own), (int)atomic_load(&s_unlock_fv),

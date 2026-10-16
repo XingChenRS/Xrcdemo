@@ -120,7 +120,8 @@ BRK_HOOKS = [
     ("ap_tickcnt2",      0x10091DDBC, 0x1014680F8, "fa0300aa"),  # MOV X26,X0（helper2=sub_10091E958 返回后，Lost tick 数）
     # ---- 曲目锁态覆盖（取证 research/notes/xrc-packlock-rootcause-2026-09-19.md）----
     # 锁状态函数 sub_100919E5C 的两个专属子分支（各自唯一调用方=锁态函数自身）：
-    #   FV 五曲 fast path / DO(konzetsu) 分支。入口直返 0x0101010101（五难度类全解锁）；
+    #   FV 五曲 fast path / DO(konzetsu) 分支。入口直返 0（⚠ 极性 2026-10-16 修正：
+    #   五字节序 **1=锁、0=可玩**；旧值 0x0101010101 实为"全锁死"）；
     #   开关 unlockFv / unlockDo 关时重放原指令走原路径。两处入口指令均 SP 相对、重放安全。
     ("lock_fv",          0x100991508, 0x101468100, "f44fbea9"),  # STP X20,X19,[SP,#-0x20]!（FV 五曲 fast path 入口）
     ("lock_do",          0x100AAE50C, 0x101468108, "ff4303d1"),  # SUB SP,#0xD0（DO/konzetsu 分支入口）
@@ -135,19 +136,22 @@ BRK_HOOKS = [
     ("chain_prog",       0x10098FB1C, 0x101468118, "ffc302d1"),  # SUB SP,#0xB0（链进度 sub_10098FB1C 入口）
     # ---- 全条件放行（unlock_all / dl_ready；2026-10-12；站点/证据链见 XRCProfile.h 同名块）----
     # 目标：本地存在合法谱面（难度已声明 song+0x250[idx]）时，任何"条件"不得阻止可见/可玩。
-    #   ① lock_all   = 锁态总源 sub_100919E5C（44 调用点：cell/曲绘/横幅/世界/包页）→ 0x0101010101
+    #   ① lock_all   = 锁态总源 sub_100919E5C（44 调用点：cell/曲绘/横幅/世界/包页）→ 0（0=可玩；⚠ 极性 2026-10-16 修正）
     #   ② play_gate  = 可玩性总源 sub_100919874（70 调用点：start 钮/开局链）→ 1（守卫：难度须已声明）
     #   ③ cond_unlock_a/b = 难度条件求值 sub_100BDC5A8/sub_100BDC8D4（解锁条件对象家族）→ 1
     #   ④ dl_play    = 下载"需动作"谓词 sub_100850308（2 调用点：start 钮图标/开局弹窗分流）→ 0
     #      ⚠ 不动 sub_100844774（下载机制本体，2026-09-28 教训）；缺文件仍由开局链温和失败+重扫。
     #   ⑤ jacket_lock = sub_10084EE7C 内 0x84EF48 `TBNZ X0,#0x20`（arghena 专属锁绘分支；
     #      与 unlockDo/unlockAll 的 b4=1 联动）。**no-replay**（PC 相对条件分支，handler 按位复现）。
-    #   配对标记 "unlock-policy v1"（dylib 侧须存在，缺则拒配——见 main() 的配对校验）。
+    #   配对标记 "unlock-policy v2"（dylib 侧须存在，缺则拒配——见 main() 的配对校验）。
     ("lock_all",         0x100919E5C, 0x101468138, "ffc302d1"),  # SUB SP,#0xB0（锁态总源入口）
     ("play_gate",        0x100919874, 0x101468140, "ff8301d1"),  # SUB SP,#0x60（可玩性总源入口）
     ("dl_play",          0x100850308, 0x101468148, "f657bda9"),  # STP X22,X21,[SP,#-0x30]!（需动作谓词入口）
     ("cond_unlock_a",    0x100BDC5A8, 0x101468150, "ff4302d1"),  # SUB SP,#0x90（难度条件求值 A）
     ("cond_unlock_b",    0x100BDC8D4, 0x101468158, "ff8301d1"),  # SUB SP,#0x60（难度条件求值 B）
+    # ⑥ pack_open  = 包状态机 sub_100CD0108（13 调用点：FV「先过 Black Fate」点击拦截/封面/
+    #      歌列表跳过）→ 3（已拥有；1=不可进）。开关 gateOpen（面板已 ||unlockAll）。入口 SUB SP,#0x50。
+    ("pack_open",        0x100CD0108, 0x101468160, "ff4301d1"),  # SUB SP,#0x50（包状态机 sub_100CD0108 入口）
     # 锁绘分支族（四处，no-replay：PC 相对条件分支，handler 按位复现；开关 = unlockAll || unlockDo）。
     # 触发器 = 锁态 bit32（b4）；置位 → sub_10084F0E8 锁绘选择器（konzetsu/finale/grievouslady/
     # tempestissimo/undyingmacula → jacket_locked_*，其余 → img/1080/jacket_locked_generic.jpg）。
@@ -193,8 +197,8 @@ RESTORE_SITES = [
 FEATURES = [
     ("unlock_own",     ["unlock_l1", "unlock_l2", "unlock_l3"],                    False, "redundant",
      "拥有链三层：归属由 cb 三清单 + 服务器授予决定；本组覆盖服务器未授予而本地已有内容的场景"),
-    ("unlock_lock",    ["lock_fv", "lock_do", "fv_gate"],                          True,  "stable",
-     "曲目锁态覆盖（FV/DO 五难度全解）+ 终章链门放行（整表解锁总闸）"),
+    ("unlock_lock",    ["lock_fv", "lock_do", "fv_gate", "pack_open"],             True,  "stable",
+     "曲目锁态覆盖（FV/DO 五难度全解）+ 终章链门/包状态机放行（gateOpen；FV 包「先过 Black Fate」门同闸）"),
     ("chain_guard",    ["chain_prog"],                                             True,  "required",
      "7.0 链查表守崩桩（恒生效；防改名/挪包 NULL 崩）"),
     ("unlock_all",     ["lock_all", "play_gate", "cond_unlock_a", "cond_unlock_b",
@@ -878,15 +882,15 @@ def main():
             print("    for renamed ids / moved packs. Refusing to mix.")
             sys.exit(3)
 
-    # 同款配对校验：全条件放行族（unlock_all/dl_ready 诸站）需要 dylib 侧处理器。
+    # 同款配对校验：全条件放行族（unlock_all/dl_ready 诸站 + pack_open）需要 dylib 侧处理器。
     # jacket_* 是 no-replay 条件分支桩：旧 dylib 无处理器时会落兜底/默认陷阱 → 必须拒配。
     if any(n in ("lock_all", "play_gate", "dl_play", "cond_unlock_a", "cond_unlock_b",
-                 "jacket_lock", "jacket_cell", "jacket_info", "jacket_panel")
+                 "jacket_lock", "jacket_cell", "jacket_info", "jacket_panel", "pack_open")
            for n, _s, _r, _e in BRK_HOOKS):
-        marker = b"unlock-policy v1"
+        marker = b"unlock-policy v2"
         if not any(marker in open(d, "rb").read() for d in dylibs):
-            print("[!] dylibs lack 'unlock-policy v1' support —")
-            print("    unlock-policy BRK sites (incl. no-replay jacket_lock) would fall")
+            print("[!] dylibs lack 'unlock-policy v2' support —")
+            print("    unlock-policy BRK sites (incl. no-replay jacket_lock / pack_open) would fall")
             print("    through to the default trap handlers. Refusing to mix.")
             sys.exit(3)
 

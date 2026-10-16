@@ -373,9 +373,10 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
 //（幂等，均为原子写）。
 static void xrc_apply_switches(void) {
     @try {
-        // 「全部解锁」是总闸：开 ⇒ FV/DO/链门/下载谓词一并放行（与细项 OR，细项仍可单独用）；
-        // 关 ⇒ 全部逐字节恢复原行为（桩处理器在开关=0 时重放原指令，不做任何反向锁定）。
-        xrc_brk_set_unlock_own(g_cfg.unlock_own);
+        // 「全部解锁」是总闸：开 ⇒ 拥有链/FV/DO/链门（含包状态机）/下载谓词一并放行（与细项 OR，
+        // 细项仍可单独用）；关 ⇒ 全部逐字节恢复原行为（桩处理器在开关=0 时重放原指令，不做反向锁定）。
+        // ⚠ 拥有链三站在 release 包默认未注入（inject.py 归 redundant）——此 OR 于 dev/显式启用时生效。
+        xrc_brk_set_unlock_own(g_cfg.unlock_own || g_cfg.unlock_all);
         xrc_brk_set_unlock_fv(g_cfg.unlock_fv || g_cfg.unlock_all);
         xrc_brk_set_unlock_do(g_cfg.unlock_do || g_cfg.unlock_all);
         xrc_brk_set_gate_open(g_cfg.gate_open || g_cfg.unlock_all);

@@ -320,9 +320,10 @@
 #define XRC_BRK_AP_TICKCNT2_SITE_OFF    (0x91DDBCULL) // helper2(sub_10091E958, Lost tick) 返回后：X0 = 本次 Lost tick 数
 #define XRC_BRK_AP_TICKCNT1_REPLAY_OFF  (0x14680F0ULL)
 #define XRC_BRK_AP_TICKCNT2_REPLAY_OFF  (0x14680F8ULL)
-// 曲目锁态覆盖站点（取证 research/notes/xrc-packlock-rootcause-2026-09-19.md）：
+// 曲目锁态覆盖站点（取证 research/notes/xrc-packlock-rootcause-2026-09-19.md；
+// ⚠ 极性 2026-10-16 修正：五字节序 **1 = 锁、0 = 可玩**，详见下方"全条件放行"块）：
 // 锁状态函数 sub_100919E5C 内的两个专属子分支，各自只有唯一调用方（锁态函数自身），
-// 入口直返 0x0101010101（b0..b4 = PST/PRS/FTR/BYD/INS 全解锁）即可对齐显示；开关 = unlockFv / unlockDo。
+// 入口直返 0（普通歌曲的原生"干净"值）即可对齐显示；开关 = unlockFv / unlockDo。
 //   · 0x991508 = FV 五曲 fast path（入口 STP X20,X19,[SP,#-0x20]!；重放安全）
 //   · 0xAAE50C = DO(konzetsu) 分支（入口 SUB SP,#0xD0；重放安全）
 #define XRC_BRK_LOCK_FV_SITE_OFF        (0x991508ULL)
@@ -354,8 +355,11 @@
 //   xrc-download-state-rootcause 三笔记交叉一致。
 // 目标（第一性原理）：**本地存在合法谱面（该难度在 songlist 声明，song+0x250[idx]!=0）时，
 //   任何"条件"不得阻止其可见、可游玩**。四处判定源头（覆盖 44+70+37/19+2 个调用点）：
-//   ① 锁态总源 sub_100919E5C（入口 SUB SP,#0xB0）——五字节打包 b0..b4=1 才显示"全解锁"；
-//      44 个调用点（选曲 cell/曲绘/横幅/世界/包页）全部读它。直返 0x0101010101。
+//   ① 锁态总源 sub_100919E5C（入口 SUB SP,#0xB0）——五字节打包 b0..b4 = 按难度锁态，
+//      **1 = 锁、0 = 可玩**（2026-10-16 指令级四锚点修正；此前"1=可玩"是把本函数
+//      「未声明难度→0x0101010101 早退」误读为"全解锁"，四锚点＝BDCD2C 阻塞谓词拷贝进字节 /
+//      8660F8 放行判"非全 1" / 标题守卫 bit0=1→"???" / DO 分支构造 未满足=0x0101010101、满足=0）；
+//      44 个调用点（选曲 cell/曲绘/横幅/世界/包页）全部读它。直返 0（普通歌曲原生值）。
 //   ② 可玩性总源 sub_100919874（入口 SUB SP,#0x60）——选曲 start 钮/开局链的唯一谓词，
 //      70 个调用点且消费方按 CBNZ=可用 判（50 8EAF84、70 B60ECC L621 为典型）。直返 1。
 //      ⚠ 守卫：仅当该难度"已声明"才放行（song+0x250[BDCD20(diff)]!=0）——没有谱面的难度
@@ -379,10 +383,21 @@
 #define XRC_BRK_COND_UNLOCK_B_REPLAY_OFF (0x1468158ULL)
 #define XRC_BRK_DL_PLAY_SITE_OFF       (0x850308ULL)   // ④ sub_100850308 入口
 #define XRC_BRK_DL_PLAY_REPLAY_OFF     (0x1468148ULL)
+// ⑤ 包状态机 sub_100CD0108（0x268 长）——pack 级"可否进入/是否可见"的唯一来源（13 个调用点）：
+//   返回 1 = 不可进（点击拦截 sub_100B17274 弹 `story_pack_lock_message.png` +
+//   「Complete 'Black Fate' and see VS-8 to progress to this Pack」@0x1013A732C；封面
+//   sub_100CCFE68 换 `pack_inaccessible.png`；歌列表 sub_10087DF94 跳过该包），2/3 = 可进（3 = 已拥有）。
+//   FV 包（isFinale）判定 =（拥有 || 非 finale）→ 2/3；否则查世界进度字节 + 按名拥有 "vs"。
+//   ——与 fv_gate(56C，歌曲级) 结构上无关（全调用点核对，2026-10-16）。
+//   入口直返 3（已拥有）→ 包可进、封面正常、曲目不跳过；开关 = gateOpen（面板已 ||unlockAll）。
+//   入口指令 SUB SP,SP,#0x50（SP 相对、重放安全）。出处：.idamcp/_hot_100CD0108.c、
+//   _hot7_asm_cd0108_body.txt、_hot3_B17274.c、_hot3_CCFE68.c、_hot2_callers_CD0108.txt。
+#define XRC_BRK_PACK_OPEN_SITE_OFF      (0xCD0108ULL)
+#define XRC_BRK_PACK_OPEN_REPLAY_OFF    (0x1468160ULL)
 // arghena 专属锁绘旁路：sub_10084EE7C 内 0x84EF48 的 `TBNZ X0,#0x20`（X0 = sub_100919E5C
-//   返回值，bit32 = b4/INS）。置位 → 落 0x84F05C → 调 sub_10084F0E8 →（包==konzetsu）
-//   `img/jacket_locked_konzetsu.jpg`。⚠ 该位与"五难度全解"共用（unlockDo/unlockAll 置 b4=1
-//   ⇒ arghena 曲绘变"锁绘"）→ 本桩 ON 时恒"不跳"（普通曲绘）、OFF 时按位复现原分支。
+//   返回值，bit32）。置位（= 锁态标志之一）→ 落 0x84F05C → 调 sub_10084F0E8 →（包==konzetsu）
+//   `img/jacket_locked_konzetsu.jpg`。锁态桩现值 0 ⇒ 本族与原生同侧（冗余保险）；
+//   ON 时恒"不跳"（普通曲绘）、OFF 时按位复现原分支。
 // 锁绘分支族（四处，均为 PC 相对条件分支 → no-replay，handler 按位复现；开关 = unlock_all ||
 //   unlock_do）。全链证据：sub_10084F0E8 = 锁绘选择器（包 konzetsu/finale → jacket_locked_*；
 //   id grievouslady/tempestissimo → "img/jacket_locked_"+id；undyingmacula 专属；其余 →
