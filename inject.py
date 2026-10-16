@@ -143,7 +143,7 @@ BRK_HOOKS = [
     #      ⚠ 不动 sub_100844774（下载机制本体，2026-09-28 教训）；缺文件仍由开局链温和失败+重扫。
     #   ⑤ jacket_lock = sub_10084EE7C 内 0x84EF48 `TBNZ X0,#0x20`（arghena 专属锁绘分支；
     #      与 unlockDo/unlockAll 的 b4=1 联动）。**no-replay**（PC 相对条件分支，handler 按位复现）。
-    #   配对标记 "unlock-policy v2"（dylib 侧须存在，缺则拒配——见 main() 的配对校验）。
+    #   配对标记 "unlock-policy v3"（dylib 侧须存在，缺则拒配——见 main() 的配对校验）。
     ("lock_all",         0x100919E5C, 0x101468138, "ffc302d1"),  # SUB SP,#0xB0（锁态总源入口）
     ("play_gate",        0x100919874, 0x101468140, "ff8301d1"),  # SUB SP,#0x60（可玩性总源入口）
     ("dl_play",          0x100850308, 0x101468148, "f657bda9"),  # STP X22,X21,[SP,#-0x30]!（需动作谓词入口）
@@ -152,6 +152,11 @@ BRK_HOOKS = [
     # ⑥ pack_open  = 包状态机 sub_100CD0108（13 调用点：FV「先过 Black Fate」点击拦截/封面/
     #      歌列表跳过）→ 3（已拥有；1=不可进）。开关 gateOpen（面板已 ||unlockAll）。入口 SUB SP,#0x50。
     ("pack_open",        0x100CD0108, 0x101468160, "ff4301d1"),  # SUB SP,#0x50（包状态机 sub_100CD0108 入口）
+    # ⑦ shutter_done = 进歌在线检查完成位（scene+0x348）唯一清零点（0x100976F68，
+    #      `strb wzr,[x19,#0x348]`）→ 跳过清 0（完成位恒 1；7s 逐帧等待与
+    #      Network Error 弹窗不可达，等效自动 Continue Offline）。开关 gateOpen；
+    #      站点为非 PC 相对普通存储（可重放）；slot 0x101468168 已核全零。
+    ("shutter_done",     0x100976F68, 0x101468168, "7f220d39"),  # strb wzr,[x19,#0x348]（唯一清 0）
     # 锁绘分支族（四处，no-replay：PC 相对条件分支，handler 按位复现；开关 = unlockAll || unlockDo）。
     # 触发器 = 锁态 bit32（b4）；置位 → sub_10084F0E8 锁绘选择器（konzetsu/finale/grievouslady/
     # tempestissimo/undyingmacula → jacket_locked_*，其余 → img/1080/jacket_locked_generic.jpg）。
@@ -195,10 +200,11 @@ RESTORE_SITES = [
 #   status: required=守崩必备 / stable=稳定 / redundant=由其它机制覆盖（默认不进 release）
 #           / debug=调试采集（默认不进 release）
 FEATURES = [
-    ("unlock_own",     ["unlock_l1", "unlock_l2", "unlock_l3"],                    False, "redundant",
-     "拥有链三层：归属由 cb 三清单 + 服务器授予决定；本组覆盖服务器未授予而本地已有内容的场景"),
-    ("unlock_lock",    ["lock_fv", "lock_do", "fv_gate", "pack_open"],             True,  "stable",
-     "曲目锁态覆盖（FV/DO 五难度全解）+ 终章链门/包状态机放行（gateOpen；FV 包「先过 Black Fate」门同闸）"),
+    ("unlock_own",     ["unlock_l1", "unlock_l2", "unlock_l3"],                    True,  "stable",
+     "拥有链三层：归属由 cb 三清单 + 服务器授予决定；恒真=视为已有内容。2026-10-16 起 release 纳入："
+     "点 START 归属复查（sub_100C14898→sub_100C0FEB4 离线门→登录弹窗）与曲包状态机（CD0108 两处消费 BE46A8）同源"),
+    ("unlock_lock",    ["lock_fv", "lock_do", "fv_gate", "pack_open", "shutter_done"], True, "stable",
+     "曲目锁态覆盖（FV/DO 五难度全解）+ 终章链门/包状态机/进歌在线检查放行（gateOpen 同闸）"),
     ("chain_guard",    ["chain_prog"],                                             True,  "required",
      "7.0 链查表守崩桩（恒生效；防改名/挪包 NULL 崩）"),
     ("unlock_all",     ["lock_all", "play_gate", "cond_unlock_a", "cond_unlock_b",
@@ -882,16 +888,17 @@ def main():
             print("    for renamed ids / moved packs. Refusing to mix.")
             sys.exit(3)
 
-    # 同款配对校验：全条件放行族（unlock_all/dl_ready 诸站 + pack_open）需要 dylib 侧处理器。
+    # 同款配对校验：全条件放行族（unlock_all/dl_ready 诸站 + pack_open + shutter_done）需要 dylib 侧处理器。
     # jacket_* 是 no-replay 条件分支桩：旧 dylib 无处理器时会落兜底/默认陷阱 → 必须拒配。
     if any(n in ("lock_all", "play_gate", "dl_play", "cond_unlock_a", "cond_unlock_b",
-                 "jacket_lock", "jacket_cell", "jacket_info", "jacket_panel", "pack_open")
+                 "jacket_lock", "jacket_cell", "jacket_info", "jacket_panel", "pack_open",
+                 "shutter_done")
            for n, _s, _r, _e in BRK_HOOKS):
-        marker = b"unlock-policy v2"
+        marker = b"unlock-policy v3"
         if not any(marker in open(d, "rb").read() for d in dylibs):
-            print("[!] dylibs lack 'unlock-policy v2' support —")
-            print("    unlock-policy BRK sites (incl. no-replay jacket_lock / pack_open) would fall")
-            print("    through to the default trap handlers. Refusing to mix.")
+            print("[!] dylibs lack 'unlock-policy v3' support —")
+            print("    unlock-policy BRK sites (incl. no-replay jacket_lock / pack_open / shutter_done)")
+            print("    would fall through to the default trap handlers. Refusing to mix.")
             sys.exit(3)
 
     os.makedirs(FW_DIR, exist_ok=True)

@@ -212,6 +212,11 @@
 // 置假 → 走重放跳板，行为与未注入完全一致。
 // ⚠ 本组（拥有链三层）：归属由 cb 三清单 + 服务器授予决定，仅覆盖"服务器未授予、
 //   但本地已有内容"的情形。开关 unlockOwn 默认关。
+//   2026-10-16 起 release 构建亦注入（归属复查是 start 门的上游，见下）：
+//   点 START 的归属复查链 = sub_100C14898（L3/L1）→ 未拥有 → sub_100C0FEB4 离线门失败
+//   → sub_100C0DDA8 弹「You must be online and logged in to unlock songs…」；
+//   曲包状态机 sub_100CD0108 在两处消费同一 BE46A8（曲包锁与可玩性同源）。
+//   消费点极性核验：0x100C15394 `TBZ W0,#0 → 未拥有分支`（**1 = 拥有**）。
 #define XRC_BRK_UNLOCK_L1_SITE_OFF   (0xBE46ACULL)  // 层1 第 2 条指令（首条 CBZ X1 是
                                                     // PC 相关指令、不可重放；本条 LDR 安全）
 #define XRC_BRK_UNLOCK_L1_REPLAY_OFF (0x1468058ULL)
@@ -394,6 +399,14 @@
 //   _hot7_asm_cd0108_body.txt、_hot3_B17274.c、_hot3_CCFE68.c、_hot2_callers_CD0108.txt。
 #define XRC_BRK_PACK_OPEN_SITE_OFF      (0xCD0108ULL)
 #define XRC_BRK_PACK_OPEN_REPLAY_OFF    (0x1468160ULL)
+// ⑥ 进歌在线检查完成位（TransitionShutter）：`scene+0x348` 的**唯一清零点** 0x976F68
+//   （`strb wzr,[x19,#0x348]`；建厂期由 setter 置 1）。两个消费点均按 ==1 放行
+//   （0x100979E60 调度端 / 0x10097A1AC 等待端）；离线时在线上报必失败、失败路径不置 1
+//   ⇒ 逐帧等待吃满 7.0s 弹「Network Error / Retry / Continue Offline」。跳过清 0 ⇒
+//   完成位恒 1 ⇒ 等待与弹窗结构性不可达（等效自动 Continue Offline）。开关 = gateOpen。
+//   站点指令为非 PC 相对普通存储（重放安全）。出处 .idamcp/_login_inv/（2026-10-16 专项）。
+#define XRC_BRK_SHUTTER_DONE_SITE_OFF   (0x976F68ULL)
+#define XRC_BRK_SHUTTER_DONE_REPLAY_OFF (0x1468168ULL)
 // arghena 专属锁绘旁路：sub_10084EE7C 内 0x84EF48 的 `TBNZ X0,#0x20`（X0 = sub_100919E5C
 //   返回值，bit32）。置位（= 锁态标志之一）→ 落 0x84F05C → 调 sub_10084F0E8 →（包==konzetsu）
 //   `img/jacket_locked_konzetsu.jpg`。锁态桩现值 0 ⇒ 本族与原生同侧（冗余保险）；

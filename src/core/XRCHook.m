@@ -185,7 +185,7 @@ static void s_ret(uint64_t val, void *vctx) {
 //   own  → unlock_l1/l2/l3（拥有链；覆盖"服务器未授予、本地已有内容"的离线场景）
 //   fv   → lock_fv（FV 五曲 fast path → 五难度全解）
 //   do   → lock_do（DO/konzetsu 分支 → 同上）
-//   gate → fv_gate + pack_open（终章链门 / 包状态机；gate 族放行档：链门 1=放行、包 3=已拥有）
+//   gate → fv_gate + pack_open + shutter_done（终章链门/包状态机/进歌在线检查；gate 族放行档）
 //   all  → lock_all/play_gate/cond_unlock_*（全条件放行：锁态/可玩性/条件判定源头恒真；
 //          另与 do 联动旁路锁绘族（含 arghena 专属曲绘）——见 s_jacket_branch）
 //   dl   → dl_play（下载"需动作"谓词恒 0：开局不转"Download song?"弹窗；文件存在性开局链亲验）
@@ -344,6 +344,20 @@ static void s_finale_gate_open(void *vctx) {
 static void s_pack_open(void *vctx) {
     if (!atomic_load(&s_gate_open)) return;
     s_ret(3, vctx);
+}
+
+// 进歌在线检查等待（开关 gateOpen）：`scene+0x348`「在线检查完成」位的**唯一清零点**
+// 0x100976F68（`strb wzr,[x19,#0x348]`，2026-10-16 登录门专项核验）。跳过该清 0 ⇒
+// 完成位保持建厂值 1 ⇒ TransitionShutter 的逐帧等待（7.0s 超时）与
+// 「Network Error / Retry / Continue Offline」弹窗结构性不可达（等效自动 Continue Offline）。
+// 关：重放原存储（slot 0x1468168），逐字节同原行为。
+static void s_shutter_done(void *vctx) {
+    if (!atomic_load(&s_gate_open)) return;
+    ucontext_t *uc = (ucontext_t *)vctx;
+    if (!uc || !uc->uc_mcontext) return;
+    __typeof__(uc->uc_mcontext->__ss) *ss = &uc->uc_mcontext->__ss;
+    __darwin_arm_thread_state64_set_pc_fptr(*ss,
+        (void *)((uint64_t)__darwin_arm_thread_state64_get_pc(*ss) + 4));
 }
 
 // 链进度覆盖：`sub_10098FB1C` 是 7.0 新增「链」系统的查表点——硬编码曲名（InitFunc_194 表）
@@ -853,6 +867,7 @@ static const xrc_brk_entry_t k_brk_entries[] = {
     { "lock_do",          XRC_BRK_LOCK_DO_SITE_OFF,         XRC_BRK_LOCK_DO_REPLAY_OFF,         s_lock_do },
     { "fv_gate",          XRC_BRK_FV_GATE_SITE_OFF,         XRC_BRK_FV_GATE_REPLAY_OFF,         s_finale_gate_open },
     { "pack_open",        XRC_BRK_PACK_OPEN_SITE_OFF,       XRC_BRK_PACK_OPEN_REPLAY_OFF,       s_pack_open },
+    { "shutter_done",     XRC_BRK_SHUTTER_DONE_SITE_OFF,    XRC_BRK_SHUTTER_DONE_REPLAY_OFF,    s_shutter_done },
     { "chain_prog",       XRC_BRK_CHAIN_PROG_SITE_OFF,      XRC_BRK_CHAIN_PROG_REPLAY_OFF,      s_chain_prog_neutral },
     // ---- 全条件放行（unlock_all / dl_ready；站点/出处见 XRCProfile.h 同名块）----
     { "lock_all",         XRC_BRK_LOCK_ALL_SITE_OFF,        XRC_BRK_LOCK_ALL_REPLAY_OFF,        s_lock_all },
@@ -1030,7 +1045,7 @@ static const xrc_static_patch_t k_static_patches[] = {
 typedef struct { const char *feature; const char *sites[10]; int n; } xrc_feature_sites_t;
 static const xrc_feature_sites_t k_feature_sites[] = {
     { "unlock_own",     { "unlock_l1", "unlock_l2", "unlock_l3" }, 3 },
-    { "unlock_lock",    { "lock_fv", "lock_do", "fv_gate", "pack_open" }, 4 },
+    { "unlock_lock",    { "lock_fv", "lock_do", "fv_gate", "pack_open", "shutter_done" }, 5 },
     { "chain_guard",    { "chain_prog" }, 1 },
     { "unlock_all",     { "lock_all", "play_gate", "cond_unlock_a", "cond_unlock_b",
                           "jacket_lock", "jacket_cell", "jacket_info", "jacket_panel" }, 8 },
@@ -1146,10 +1161,10 @@ void xrc_brk_setup(uint64_t image_base) {
     // 配对标记 ②：链进度覆盖桩（chain_prog，7.0 新增「链」系统的查表点）由本 dylib 处理；
     // 旧 dylib 命中该站点会重放原指令 → 崩因依旧，注入脚本据此拒配。此桩**不设开关、恒生效**。
     xrc_logi(XRCLC_BOOT, @"[brk] chain-guard v1 ready (chain_prog -> 100, always-on)");
-    // 配对标记 ③：全条件放行族（lock_all/play_gate/cond_unlock_*/jacket_*/dl_play/pack_open）。
+    // 配对标记 ③：全条件放行族（lock_all/play_gate/cond_unlock_*/jacket_*/dl_play/pack_open/shutter_done）。
     // jacket_* 是 no-replay 条件分支桩（旧 dylib 无处理器时落兜底/默认陷阱）→ 注入脚本据此拒配。
-    // v1→v2（2026-10-16）：新增 pack_open（包状态机）；旧 dylib 无该处理器 ⇒ 标记换代，注入脚本拒配。
-    xrc_logi(XRCLC_BOOT, @"[brk] unlock-policy v2 ready (lock_all/play_gate/cond_unlock/jacket_* -> unlockAll; dl_play -> dlReady; pack_open -> gateOpen)");
+    // v2→v3（2026-10-16）：新增 shutter_done（进歌在线检查等待）；旧 dylib 无该处理器 ⇒ 换代拒配。
+    xrc_logi(XRCLC_BOOT, @"[brk] unlock-policy v3 ready (lock_all/play_gate/cond_unlock/jacket_* -> unlockAll; dl_play -> dlReady; pack_open/shutter_done -> gateOpen)");
     // 开关组（策略/plist 驱动）
     xrc_logi(XRCLC_BOOT, @"[brk] switches: own=%d fv=%d do=%d gate=%d all=%d dl=%d (slots=%d)",
             (int)atomic_load(&s_unlock_own), (int)atomic_load(&s_unlock_fv),
