@@ -1067,12 +1067,32 @@ static void rpf_rebuild_dispatch(uint64_t scene, int n) {
 #define XRC_RT_SUB_RENDER   (0x40ULL)
 #define XRC_RT_ARC_TAPS_B   (0x2A8ULL)
 #define XRC_RT_ARC_TAPS_E   (0x2B0ULL)
-#define XRC_RT_FIX_MAX      512
+#define XRC_RT_FIX_MIN      512      /* 起始容量——512 实测会被打满（日志实证：满后新残留不再压制 ⇒ 黑点累积） */
+#define XRC_RT_FIX_MAX      32768    /* 硬上限（512KB 内存）：动态扩容，到限才放弃 */
 
 typedef struct { uint64_t tap; uint8_t saved; } rpf_tapfix_t;
-static rpf_tapfix_t s_tapfix[XRC_RT_FIX_MAX];
+static rpf_tapfix_t *s_tapfix = NULL;         /* 动态数组（仅主队列访问） */
+static int           s_tapfix_cap = 0;        /* 已分配容量（仅主队列） */
 static _Atomic(int) s_tapfix_n = 0;           /* 仅主队列写；常驻线程只原子读 */
+static _Atomic(bool) s_tapfix_full = false;   /* 已到硬上限（诊断） */
 static _Atomic(uint32_t) s_tapfix_total = 0;  /* 诊断累计 */
+
+// 追加一条（仅主队列）：满则翻倍扩容，到硬上限才失败（调用方告警并放弃本条）。
+static bool rpf_tapfix_push(uint64_t tap, uint8_t saved) {
+    int n = atomic_load(&s_tapfix_n);
+    if (n >= s_tapfix_cap) {
+        int ncap = s_tapfix_cap ? s_tapfix_cap * 2 : XRC_RT_FIX_MIN;
+        if (ncap > XRC_RT_FIX_MAX || ncap <= s_tapfix_cap) return false;
+        rpf_tapfix_t *np = realloc(s_tapfix, sizeof(rpf_tapfix_t) * (size_t)ncap);
+        if (!np) return false;
+        s_tapfix = np;
+        s_tapfix_cap = ncap;
+    }
+    s_tapfix[n].tap = tap;
+    s_tapfix[n].saved = saved;
+    atomic_store(&s_tapfix_n, n + 1);
+    return true;
+}
 
 // 身份校验：vptr 精确匹配 + 子音符回指（挡旧对象/内存复用/跨场景残留）。
 static bool rpf_rt_valid(uint64_t tap, uint64_t *sub_out) {
@@ -1119,20 +1139,20 @@ static void rpf_arctap_residue_pass(uint64_t scene) {
             if (dup) continue;
             uint8_t cur = rd8(tap + XRC_RT_T_BASEOP);
             if (cur == 0) continue;        // 已是 0：不记（防把"恢复值"记成 0）
-            if (n >= XRC_RT_FIX_MAX) continue;   // 表满：跳过（末尾告警）
-            s_tapfix[n].tap = tap;
-            s_tapfix[n].saved = cur;
-            atomic_store(&s_tapfix_n, n + 1);
+            if (!rpf_tapfix_push(tap, cur)) {
+                atomic_store(&s_tapfix_full, true);
+                continue;
+            }
             wr8(tap + XRC_RT_T_BASEOP, 0);
             atomic_fetch_add(&s_tapfix_total, 1);
             fixed++;
         }
     }
     if (fixed)
-        xrc_logi(XRCLC_JUDGE, @"[rpf] arctap 残留处置：本次 %d 条（累计 %u，表 %d）",
-                 fixed, atomic_load(&s_tapfix_total), atomic_load(&s_tapfix_n));
-    if (atomic_load(&s_tapfix_n) >= XRC_RT_FIX_MAX)
-        xrc_logw(XRCLC_JUDGE, @"[rpf] arctap 处置表已满（%d）——后续残留本轮不处置", XRC_RT_FIX_MAX);
+        xrc_logi(XRCLC_JUDGE, @"[rpf] arctap 残留处置：本次 %d 条（累计 %u，表 %d/%d）",
+                 fixed, atomic_load(&s_tapfix_total), atomic_load(&s_tapfix_n), s_tapfix_cap);
+    if (atomic_load(&s_tapfix_full))
+        xrc_logw(XRCLC_JUDGE, @"[rpf] arctap 处置表达硬上限（%d）——后续残留不再处置（会话级饱和）", XRC_RT_FIX_MAX);
 }
 
 // 恢复侧（主队列，常驻线程按需派发）：**以武装时同一判据的反面为准**——不再满足残留谓词
