@@ -1015,6 +1015,9 @@ static void rpf_rebuild_main(void *ctx) {
     }
     /* 本任务（重建/连线补齐）是重置链最后一棒 ⇒ 冻结窗收口（恢复音频 + 收敛窗）。
        若外层当前没有冻结窗，xrc_freeze_end 是空操作（幂等）。 */
+    /* 重建可能为同一批残留音符换了**新渲染对象**（工厂回写 note+0x40；新对象首帧同样进入
+       "主透明+阴影亮"的残留态）——收口前对工厂产物再扫一遍（已在表内的旧对象按 tap 指针去重跳过）。 */
+    rpf_arctap_residue_pass(j->scene);
     rpf_freeze_end();
     free(j->notes);
     free(j);
@@ -1063,7 +1066,7 @@ static void rpf_rebuild_dispatch(uint64_t scene, int n) {
 #define XRC_RT_SUB_RENDER   (0x40ULL)
 #define XRC_RT_ARC_TAPS_B   (0x2A8ULL)
 #define XRC_RT_ARC_TAPS_E   (0x2B0ULL)
-#define XRC_RT_FIX_MAX      64
+#define XRC_RT_FIX_MAX      512
 
 typedef struct { uint64_t tap; uint8_t saved; } rpf_tapfix_t;
 static rpf_tapfix_t s_tapfix[XRC_RT_FIX_MAX];
@@ -1131,27 +1134,25 @@ static void rpf_arctap_residue_pass(uint64_t scene) {
         xrc_logw(XRCLC_JUDGE, @"[rpf] arctap 处置表已满（%d）——后续残留本轮不处置", XRC_RT_FIX_MAX);
 }
 
-// 恢复侧（主队列，常驻线程按需派发）：主贴图重新可见或对象死亡 ⇒ 回写原基值 / 剔除。
+// 恢复侧（主队列，常驻线程按需派发）：**以武装时同一判据的反面为准**——不再满足残留谓词
+//（主贴图重新可见 = 重播再接近；或子音符已判定/跳过 = 残留解除；或对象死亡）⇒ 回写原基值/剔除。
+// （2026-10-16 修正：旧版读主 sprite 的 +0x1D1 不透明度字节作恢复判据——实测处置表在两次回跳
+//   之间被整表还原、写入存活不足 50ms（日志：两轮各"处置 64 条"而表恒 64）。改用与武装判据
+//   严格互补的谓词后，无贴图布局依赖、无时序竞争。）
 static void rpf_arctap_restore_sweep(void) {
     int n = atomic_load(&s_tapfix_n);
     if (n <= 0) return;
     int w = 0, restored = 0;
     for (int i = 0; i < n; i++) {
         rpf_tapfix_t e = s_tapfix[i];
-        if (!rpf_rt_valid(e.tap, NULL)) continue;                 // 对象已亡：剔除
-        uint64_t main_p = rd64(e.tap + XRC_RT_T_MAIN);
-        if (!s_ishp(main_p)) { s_tapfix[w++] = e; continue; }
-        uint8_t op = rd8(main_p + 0x1D1);                          // Node 显示不透明度（getOpacity 读它）
-        if (op != 0) {                                             // 主贴图可见：恢复阴影基值
-            wr8(e.tap + XRC_RT_T_BASEOP, e.saved);
-            restored++;
-            continue;
-        }
-        s_tapfix[w++] = e;                                         // 主仍透明（残留未解）：保留
+        if (!rpf_rt_valid(e.tap, NULL)) continue;        // 对象已亡：剔除（新对象若仍残留由后续处置覆盖）
+        if (rpf_rt_is_residue(e.tap)) { s_tapfix[w++] = e; continue; }   // 仍是残留：维持抑制
+        wr8(e.tap + XRC_RT_T_BASEOP, e.saved);           // 已解除（再接近/已判定）：回写原值
+        restored++;
     }
     atomic_store(&s_tapfix_n, w);
     if (restored)
-        xrc_logd(XRCLC_JUDGE, @"[rpf] arctap 阴影基值恢复：%d 条（表余 %d）", restored, w);
+        xrc_logi(XRCLC_JUDGE, @"[rpf] arctap 阴影基值恢复：%d 条（表余 %d）", restored, w);
 }
 
 static _Atomic(int) s_tapfix_sweep_pend = 0;
