@@ -971,6 +971,7 @@ typedef struct {
 typedef void (*xrc_line_t)(void *render_note);
 
 static void rpf_freeze_end(void);   /* 前向声明（定义在 reset_job 段；重建链末尾收口用） */
+static void rpf_arctap_residue_pass(uint64_t scene);   /* 前向声明（定义在下方 ArcTap 残留黑点块；重建收口二次处置用） */
 
 static void rpf_rebuild_main(void *ctx) {
     rpf_rebuild_job_t *j = (rpf_rebuild_job_t *)ctx;
