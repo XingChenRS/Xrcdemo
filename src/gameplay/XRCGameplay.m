@@ -170,6 +170,7 @@ static void xrc_clock_shift_to(void *note_group, int32_t target) {
     int32_t cur = xrc_chart_clock_ms(note_group);
     int32_t *base_off = (int32_t *)((char *)clk + XRC_CLK_BASE_OFF);
     *base_off = xrc_sat_add32(*base_off, xrc_sat_add32(cur, -target));
+    xrc_preview_cull_arm();
 }
 
 // 冻结窗收口（重建链末尾调用；时间兜底在 s_frz_tick）。
@@ -683,10 +684,19 @@ static void s_rate_probe_tick(void *note_group) {
     last_us = now; last_chart = chart; last_chan = chan; have = 1;
 }
 
+static _Atomic(int) s_pv_latched = 0;
+static void *s_pv_ng = NULL;
+static bool s_pv_on(void);
+static void s_pv_sweep(void *ng);
+
 void xrc_gameplay_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     if (self) {
         atomic_store(&xrc_gp_instance, self);
         void *note_group = *(void **)((char *)self + XRC_GP_NOTEGROUP_OFF);
+        if (note_group != s_pv_ng) {
+            s_pv_ng = note_group;
+            atomic_store(&s_pv_latched, 0);
+        }
         if (note_group) {
             s_pause_tick(note_group);      // 暂停护栏（判定总闸/路过跳过/冻结看护）
             s_gp_retime_logic_clock(note_group);
@@ -744,6 +754,138 @@ void xrc_gameplay_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint
     // 放这里是因为 gp.update 是唯一"进对局后每帧都在跑"的点，面板不开时也有效。
     @try { xrc_audio_speed_tick(); } @catch (NSException *e) {}
     if (s_orig_gp_update) s_orig_gp_update(self, a2, a3, a4, a5);
+    if (s_pv_on()) {
+        void *ng = s_valid_note_group(self);
+        if (ng) s_pv_sweep(ng);
+    }
+}
+
+// ---- 预览 ArcTap 裁剪 ----
+// 原生 tick（sub_1008A4284）在未消费时会把天键和 white.png 阴影重新设为可见。
+// 前跳、后跳、拖动、循环回位都会挪钟；回跳重播会把已判定的天键复活。
+// 这些场景里父弧离开活动窗口后，坐标是陈旧的，残留会贴在判定线上。
+// 裁剪从第一次挪钟或重播起保持到换曲：仍在被 tick 的，tick 返回后裁；
+// 不再被 tick 的，每帧从全谱表扫。正常开局、还没挪过钟之前不进这里。
+// 不保存「这个下标已经藏过」。不写弧端 cap。
+static void (*s_orig_arctap_tick)(void *) = NULL;
+
+void xrc_preview_cull_arm(void) { atomic_store(&s_pv_latched, 1); }
+
+static bool s_pv_on(void) {
+    return atomic_load(&s_pv_latched)
+        || atomic_load(&s_practice_paused)
+        || atomic_load(&s_frz_state) != 0;
+}
+
+static bool s_pv_hp(uint64_t v) {
+    return v >= 0x100000000ULL && v < 0x7000000000ULL && (v & 7) == 0;
+}
+
+static void *s_pv_strip(void *p) {
+#if __has_feature(ptrauth_calls)
+    return ptrauth_strip(p, ptrauth_key_asia);
+#else
+    return p;
+#endif
+}
+
+static void s_pv_hide(void *node) {
+    extern uint64_t xrc_image_base(void);
+    if (!s_pv_hp((uint64_t)node)) return;
+    void *vt = NULL;
+    memcpy(&vt, node, 8);
+    if (!s_pv_hp((uint64_t)vt)) return;
+    void *fn = NULL;
+    memcpy(&fn, (char *)vt + XRC_NODE_SETVISIBLE_SLOT, 8);
+    uint64_t base = xrc_image_base();
+    if (!base || (uint64_t)s_pv_strip(fn) != base + XRC_NODE_SETVISIBLE_OFF) return;
+    ((void (*)(void *, bool))fn)(node, false);
+}
+
+static bool s_pv_parent_live(void *ng, void *parent) {
+    uint64_t b = 0, e = 0;
+    memcpy(&b, (char *)ng + XRC_NG_NOTEVEC_BEGIN_OFF, 8);
+    memcpy(&e, (char *)ng + XRC_NG_NOTEVEC_BEGIN_OFF + 8, 8);
+    if (!s_pv_hp(b) || !s_pv_hp(e) || e < b) return false;
+    uint64_t n = (e - b) / 8;
+    if (n == 0 || n > 8192) return false;
+    for (uint64_t i = 0; i < n; i++) {
+        void *slot = NULL;
+        memcpy(&slot, (void *)(b + i * 8), 8);
+        if (slot == parent) return true;
+    }
+    return false;
+}
+
+static void s_pv_apply(void *render, void *ng) {
+    if (!s_pv_hp((uint64_t)render) || !ng) return;
+    void *logic = NULL;
+    memcpy(&logic, (char *)render + XRC_ARCTAP_LOGIC_OFF, 8);
+    if (!s_pv_hp((uint64_t)logic)) return;
+    void *back = NULL;
+    memcpy(&back, (char *)logic + XRC_LOGIC_BACK_OFF, 8);
+    if (back != render) return;
+
+    void *parent = NULL;
+    memcpy(&parent, (char *)logic + XRC_ARCTAP_PARENT_OFF, 8);
+    bool live = s_pv_hp((uint64_t)parent) && s_pv_parent_live(ng, parent);
+    int32_t position = 0, tail = 0, head = 0;
+    if (live) {
+        memcpy(&position, (char *)logic + 0x30, 4);
+        memcpy(&tail, (char *)logic + 0x34, 4);
+        memcpy(&head, (char *)logic + 0x18, 4);
+    }
+    int32_t clock = xrc_chart_clock_ms(ng);
+    bool hide = !live
+        || position <= -9000
+        || (clock >= 0 && tail >= 301 && head <= clock);
+    if (!hide) return;
+    s_pv_hide(render);
+    void *shadow = NULL;
+    memcpy(&shadow, (char *)render + XRC_ARCTAP_SHADOW_OFF, 8);
+    if (shadow != render) s_pv_hide(shadow);
+}
+
+static void s_pv_sweep(void *ng) {
+    extern uint64_t xrc_image_base(void);
+    uint64_t base = xrc_image_base();
+    uint64_t b = 0, e = 0;
+    if (!base) return;
+    memcpy(&b, (char *)ng + 0x100, 8);
+    memcpy(&e, (char *)ng + 0x108, 8);
+    if (!s_pv_hp(b) || !s_pv_hp(e) || e < b) return;
+    uint64_t n = (e - b) / 8;
+    if (n == 0 || n > 20000) return;
+    for (uint64_t i = 0; i < n; i++) {
+        void *note = NULL, *render = NULL, *vt = NULL;
+        memcpy(&note, (void *)(b + i * 8), 8);
+        if (!s_pv_hp((uint64_t)note)) continue;
+        memcpy(&render, (char *)note + XRC_LOGIC_BACK_OFF, 8);
+        if (!s_pv_hp((uint64_t)render)) continue;
+        memcpy(&vt, render, 8);
+        if ((uint64_t)s_pv_strip(vt) != base + XRC_ARCTAP_VT_OFF) continue;
+        s_pv_apply(render, ng);
+    }
+}
+
+static void s_arctap_tick(void *self) {
+    if (s_orig_arctap_tick) s_orig_arctap_tick(self);
+    if (!s_pv_on()) return;
+    void *scene = atomic_load(&xrc_gp_instance);
+    s_pv_apply(self, s_valid_note_group(scene));
+}
+
+static void s_install_arctap_cull(uint64_t image_base) {
+    int slot = xrc_swizzle_vtable(image_base + XRC_ARCTAP_VT_OFF,
+                                  XRC_ARCTAP_TICK_OFF,
+                                  (void *)s_arctap_tick,
+                                  (void **)&s_orig_arctap_tick);
+    if (slot == INT_MIN || !s_orig_arctap_tick) {
+        s_orig_arctap_tick = NULL;
+        xrc_logd(XRCLC_JUDGE, @"arctap preview cull skipped: tick slot missing");
+        return;
+    }
+    xrc_logd(XRCLC_JUDGE, @"arctap preview cull installed slot=%d", slot);
 }
 
 void xrc_gameplay_install_hooks(uint64_t image_base) {
@@ -752,13 +894,15 @@ void xrc_gameplay_install_hooks(uint64_t image_base) {
         if (!g_xrc.gp_vtable || !g_xrc.gp_update) {   // 锚点未就绪 → 降级（记日志）
             xrc_logd(XRCLC_JUDGE, @"gp hooks skipped: anchor not ready (vtable=%llx update=%llx)",
                     g_xrc.gp_vtable, g_xrc.gp_update);
-            return;
+        } else {
+            int slot = xrc_swizzle_vtable(g_xrc.gp_vtable,
+                                          g_xrc.gp_update - g_xrc.image_base,
+                                          (void *)xrc_gameplay_update,
+                                          (void **)&s_orig_gp_update);
+            if (slot != INT_MIN) xrc_logd(XRCLC_JUDGE, @"gp.update vtable installed slot=%d", slot);
         }
-        int slot = xrc_swizzle_vtable(g_xrc.gp_vtable,
-                                      g_xrc.gp_update - g_xrc.image_base,
-                                      (void *)xrc_gameplay_update,
-                                      (void **)&s_orig_gp_update);
-        if (slot != INT_MIN) xrc_logd(XRCLC_JUDGE, @"gp.update vtable installed slot=%d", slot);
+        uint64_t base = image_base ? image_base : g_xrc.image_base;
+        if (base) s_install_arctap_cull(base);
     });
 }
 

@@ -37,9 +37,9 @@ typedef enum {
 // UI 登记（非阻塞）：返回是否受理（状态机忙时拒绝）。同族（seek/回位）后到者覆盖前项。
 bool xrc_gameplay_request(xrc_op_t op, uint32_t param_ms);
 
-// ---- 练习暂停（面板开 = 暂停的总入口）----
-// 音频暂停（持有计数）+ 谱面钟冻结（warp freeze 计数）的组合；暂停期间循环 tick
-// 自动抑制（防止拖动/浏览时被自动回位打断）。幂等。
+// ---- 练习暂停（拖动 / 驻停，不是「打开面板」）----
+// 打开或展开面板不停歌。时间轴按下才暂停：音频持有计数 + 谱面钟冻结。
+// 「继续 / 关闭」才恢复。暂停期间循环 tick 自动抑制。幂等。
 void xrc_gameplay_pause(bool on);
 
 // ---- 拖动 seek（实时对齐预览）----
@@ -52,6 +52,9 @@ bool xrc_gameplay_scrub(uint32_t ms);
 
 // 最近一次拖动落笔的真实时间（us）。XRCReplay 用它做检出豁免窗。
 uint64_t xrc_gameplay_scrub_us(void);
+
+// 前跳、后跳、拖动、循环回位、回跳重播都要裁预览残留。挪钟和重播入口调用。
+void xrc_preview_cull_arm(void);
 
 // 是否处于对局中（场景活 + note 组 + 谱面钟三者齐备）。UI 用它区分菜单/对局。
 bool xrc_gameplay_in_song(void);

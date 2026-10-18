@@ -513,6 +513,20 @@
 #define XRC_ARC_IND_QUAD2_OFF       0x3CC
 #define XRC_ARC_IND_QUAD3_OFF       0x3E4
 
+// ---------------- 预览 ArcTap 裁剪（回跳黑点）----------------
+// 出处：research/notes/ios-7.0.255-04-arc-indicator-seek.md §2.3（同一镜像，
+//       官包 Arc-mobile sha256 5be475c6…）；判据与 UIP AUPPreviewVisualPolicy 一致。
+// 只在预览（练习暂停 / 冻结窗）里、原生 tick 返回之后做。不写弧端 cap，
+// 不保留处置表。父弧不在活动窗口时位置是陈旧值，只认身份。
+#define XRC_ARCTAP_VT_OFF        0x14B03E8ULL  // off_1014B03E8，RenderArcTapNote 虚表槽 0
+#define XRC_ARCTAP_TICK_OFF      0x8A4284ULL   // sub_1008A4284，虚表槽 162
+#define XRC_NODE_SETVISIBLE_OFF  0xE6BCD8ULL   // sub_100E6BCD8，Node::setVisible，槽 +0x150
+#define XRC_NODE_SETVISIBLE_SLOT 0x150
+#define XRC_ARCTAP_LOGIC_OFF     0x268         // RenderArcTapNote → LogicArcTapNote
+#define XRC_ARCTAP_SHADOW_OFF    0x290         // 本类的 white.png 阴影，不是 ArcSegment 指示器，也不是弧端 cap
+#define XRC_LOGIC_BACK_OFF       0x40          // 逻辑音符 → 自己的渲染对象
+#define XRC_ARCTAP_PARENT_OFF    0x90          // 天键逻辑 → 父弧 LogicArcNote
+
 // ---------------- OnlineManager 探针 / applog 强发（XRCOMLog）----------------
 // 出处: 真机内存转储 + 静态复核。
 //   vtable: 0x10149C100 起（[0]=offset-to-top=0、[8]=typeinfo、0x10149C110 起为槽 0）；

@@ -1512,6 +1512,7 @@ static void rpf_reset_main(void *ctx) {
 }
 
 static void rpf_reset_dispatch(uint64_t ng, uint32_t T, uint32_t P) {
+    xrc_preview_cull_arm();   /* 显式提交和水位线检出都走这里 */
     rpf_reset_job_t *j = (rpf_reset_job_t *)calloc(1, sizeof(*j));
     if (!j) return;
     j->ng = ng; j->T = T; j->P = P;
