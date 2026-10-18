@@ -685,6 +685,7 @@ static void s_rate_probe_tick(void *note_group) {
 }
 
 static _Atomic(int) s_pv_latched = 0;
+static _Atomic(uint32_t) s_pv_hide_n = 0;
 static void *s_pv_ng = NULL;
 static bool s_pv_on(void);
 static void s_pv_sweep(void *ng);
@@ -757,16 +758,21 @@ void xrc_gameplay_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint
     if (s_pv_on()) {
         void *ng = s_valid_note_group(self);
         if (ng) s_pv_sweep(ng);
+        static uint64_t s_pv_log_us = 0;
+        uint64_t now = xrc_real_now_us();
+        if (now - s_pv_log_us > 1000000ULL) {
+            s_pv_log_us = now;
+            xrc_logi(XRCLC_JUDGE, @"arctap cull 本秒藏 %u 次", atomic_exchange(&s_pv_hide_n, 0));
+        }
     }
 }
 
 // ---- 预览 ArcTap 裁剪 ----
-// 原生 tick（sub_1008A4284）在未消费时会把天键和 white.png 阴影重新设为可见。
-// 前跳、后跳、拖动、循环回位都会挪钟；回跳重播会把已判定的天键复活。
-// 这些场景里父弧离开活动窗口后，坐标是陈旧的，残留会贴在判定线上。
-// 裁剪从第一次挪钟或重播起保持到换曲：仍在被 tick 的，tick 返回后裁；
-// 不再被 tick 的，每帧从全谱表扫。正常开局、还没挪过钟之前不进这里。
-// 不保存「这个下标已经藏过」。不写弧端 cap。
+// 原生 tick 会把未消费的天键和地面阴影重新点亮。seek / 回跳之后，父弧逻辑
+// 往往还在活动窗口里，位置门也够不着，菱形就停在没有弧体、没有黑线的地方。
+// 已经挪过钟之后才查：父弧渲染对象下的弧体分段若一段都不可见，藏天键和阴影。
+// 分段还没建出来（读不到表）时不据此藏，避免弧刚入场的头一两帧被抹掉。
+// 没跳过钟的正常开局不进这里。不建处置表，不写弧端 cap。
 static void (*s_orig_arctap_tick)(void *) = NULL;
 
 void xrc_preview_cull_arm(void) { atomic_store(&s_pv_latched, 1); }
@@ -802,6 +808,41 @@ static void s_pv_hide(void *node) {
     ((void (*)(void *, bool))fn)(node, false);
 }
 
+// 1 = 至少一段弧体可见；0 = 分段都不可见；-1 = 表还没建好或读不到，不据此藏。
+static int s_pv_arc_body(void *parent) {
+    void *rp = NULL, *node = NULL, *nvt = NULL, *get = NULL;
+    memcpy(&rp, (char *)parent + XRC_LOGIC_BACK_OFF, 8);
+    if (!s_pv_hp((uint64_t)rp)) return 0;
+    memcpy(&node, (char *)rp + XRC_ARC_SEG_CONTAINER_OFF, 8);
+    if (!s_pv_hp((uint64_t)node)) return -1;
+    memcpy(&nvt, node, 8);
+    if (!s_pv_hp((uint64_t)nvt)) return -1;
+    memcpy(&get, (char *)nvt + 544, 8);          // vt[68]，与回跳重显同一条
+    if (!s_pv_hp((uint64_t)get)) return -1;
+    void *list = ((void *(*)(void *))get)(node);
+    if (!s_pv_hp((uint64_t)list)) return -1;
+    uint64_t b = 0, e = 0;
+    memcpy(&b, list, 8);
+    memcpy(&e, (char *)list + 8, 8);
+    if (!s_pv_hp(b) || !s_pv_hp(e) || e < b || (e - b) > 0x4000 || ((e - b) % 8)) return -1;
+    uint64_t n = (e - b) / 8;
+    if (n == 0) return -1;
+    int seen = 0;
+    if (n > 64) n = 64;
+    for (uint64_t i = 0; i < n; i++) {
+        void *child = NULL, *cvt = NULL, *vis = NULL;
+        memcpy(&child, (void *)(b + i * 8), 8);
+        if (!s_pv_hp((uint64_t)child)) continue;
+        memcpy(&cvt, child, 8);
+        if (!s_pv_hp((uint64_t)cvt)) continue;
+        memcpy(&vis, (char *)cvt + 0x158, 8);    // Node::isVisible，槽 43
+        if (!s_pv_hp((uint64_t)vis)) continue;
+        seen++;
+        if (((unsigned (*)(void *))vis)(child)) return 1;
+    }
+    return seen ? 0 : -1;
+}
+
 static bool s_pv_parent_live(void *ng, void *parent) {
     uint64_t b = 0, e = 0;
     memcpy(&b, (char *)ng + XRC_NG_NOTEVEC_BEGIN_OFF, 8);
@@ -828,7 +869,8 @@ static void s_pv_apply(void *render, void *ng) {
 
     void *parent = NULL;
     memcpy(&parent, (char *)logic + XRC_ARCTAP_PARENT_OFF, 8);
-    bool live = s_pv_hp((uint64_t)parent) && s_pv_parent_live(ng, parent);
+    int body = s_pv_hp((uint64_t)parent) ? s_pv_arc_body(parent) : 0;
+    bool live = body != 0 && s_pv_hp((uint64_t)parent) && s_pv_parent_live(ng, parent);
     int32_t position = 0, tail = 0, head = 0;
     if (live) {
         memcpy(&position, (char *)logic + 0x30, 4);
@@ -836,10 +878,12 @@ static void s_pv_apply(void *render, void *ng) {
         memcpy(&head, (char *)logic + 0x18, 4);
     }
     int32_t clock = xrc_chart_clock_ms(ng);
-    bool hide = !live
-        || position <= -9000
-        || (clock >= 0 && tail >= 301 && head <= clock);
+    // body==0：弧体一段都不可见，菱形不该留。body==1：弧还在，不动。
+    // body<0：分段表读不到，退回原来的窗口/位置门。
+    bool hide = body == 0 || (body < 0 && (
+        !live || position <= -9000 || (clock >= 0 && tail >= 301 && head <= clock)));
     if (!hide) return;
+    atomic_fetch_add(&s_pv_hide_n, 1);
     s_pv_hide(render);
     void *shadow = NULL;
     memcpy(&shadow, (char *)render + XRC_ARCTAP_SHADOW_OFF, 8);
@@ -885,7 +929,7 @@ static void s_install_arctap_cull(uint64_t image_base) {
         xrc_logd(XRCLC_JUDGE, @"arctap preview cull skipped: tick slot missing");
         return;
     }
-    xrc_logd(XRCLC_JUDGE, @"arctap preview cull installed slot=%d", slot);
+        xrc_logi(XRCLC_JUDGE, @"arctap preview cull installed slot=%d", slot);
 }
 
 void xrc_gameplay_install_hooks(uint64_t image_base) {
