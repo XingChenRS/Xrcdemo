@@ -535,20 +535,22 @@
 #define XRC_ARC_IND_QUAD3_OFF       0x3E4
 
 // ---------------- 判定副产物（seek / 回跳残留）----------------
-// 菱形浅色阴影不是 LogicNote / RenderNote，是判定瞬间挂上的一次性精灵。
-// 出处：
-//   · 官包 7.0.255：TrackLayer::visit 末尾 visit NoteBurst；命中链
-//     sub_100CA7538 → sub_100B2425C → sub_100A74C14 把 burst 子节点
-//     addChild 到 trackLayer+736；sub_100BAD9BC 把 hit_*.png addChild
-//     到 scene+896（UILayer）。
-//   · UIP AUPGlobalGameBridge：HideHit 认的就是 TrackBase 子节点
-//     img/lane_hit.png、NoteBurstRenderer visit、以及
-//     img/hit_pure.png / hit_far.png / hit_lost.png。
-// 只在挪钟 / 回跳重置时藏这些精灵，不碰音符、弧、天键。
+// 判定面菱形浅色阴影 = TrackBase 预建的 lane_hit，不是音符。
+// 7.0.255：init ADE95C 推进 TrackBase+0x260；hitLane AE18DC 每帧可被
+// TrackLayer::visit 第二遍 B23B14 再次点亮（源 = ng+0x120 ← 91D2F4 扫 ng+0xD0）。
+// 只按路径藏会被下一帧 hitLane 点回来。4k↔6k 能刷掉是因为 +0x354 脏位
+// 重算主轨 UV。seek 必须截断 ng+0xD0/+0x120、TrackLayer+0x290，并停 +0x260 的 Action。
+// NoteBurst / UILayer hit_*.png 仍按路径藏。不碰音符、弧、天键。
 #define XRC_SCENE_TRACKLAYER_OFF     880          // scene+880 = TrackLayer（RPF_RENDERMGR）
 #define XRC_SCENE_UILAYER_OFF        896          // scene+896 = UILayer / 判定特效管理器
+#define XRC_NG_INPUT_BEGIN_OFF       0xD0         // 活动输入指针向量，91D2F4 每帧遍历
+#define XRC_NG_HITQ_BEGIN_OFF        0x120        // 0x28 事件向量，91E364 push / B23B14 消费
+#define XRC_NG_HITQ_STRIDE           0x28
+#define XRC_TRACKLAYER_HITQ_OFF      0x290        // 嵌入拷贝自 ng+0x120
+#define XRC_TRACKBASE_LANEHIT_OFF    0x260        // 嵌入 vector<Sprite*>，每轨一颗 lane_hit
 #define XRC_TRACKLAYER_TRACKS_OFF    0x2C0        // 嵌入 vector<TrackBase*>，UIP 同偏移
 #define XRC_TRACKLAYER_BURST_OFF     736          // NoteBurstRenderer*
+#define XRC_NODE_STOPALL_OFF         0xE6B628ULL  // sub_100E6B628 = AM.removeAllActionsFromTarget
 #define XRC_NOTEBURST_PARTICLES_OFF  624          // 嵌入 vector<ParticleSystem*>，长条粒子，勿藏
 #define XRC_NODE_CHILDREN_OFF        0x140        // 间接 Vector*（UIP Node visit 同布局）
 #define XRC_SPRITE_PATH_OFF          0x450        // cocos2d::Sprite 文件名，Apple libc++ 短串

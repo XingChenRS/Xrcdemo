@@ -53,7 +53,7 @@ bool xrc_gameplay_scrub(uint32_t ms);
 // 最近一次拖动落笔的真实时间（us）。XRCReplay 用它做检出豁免窗。
 uint64_t xrc_gameplay_scrub_us(void);
 
-// 挪钟 / 回跳时清判定副产物（lane_hit、NoteBurst 闪光、hit_*.png）。
+// 挪钟 / 回跳时截断 lane_hit 事件表并停掉轨道菱形闪光（不碰音符）。
 // 不碰音符和弧。主线程立刻扫；其它线程只置位，下一帧 gp.update 再扫。
 void xrc_preview_cull_arm(void);
 

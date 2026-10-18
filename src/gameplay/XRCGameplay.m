@@ -760,11 +760,8 @@ void xrc_gameplay_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint
 }
 
 // ---- 判定副产物清理 ----
-// 往回 seek / 回跳时，音符状态会被重置，但判定瞬间挂上的精灵不会：
-//   TrackBase 子节点 img/lane_hit.png（判定面上的菱形闪光）
-//   NoteBurstRenderer 里一次性 burst 子节点（打击闪光）
-//   UILayer 子节点 img/hit_pure.png / hit_far.png / hit_lost.png
-// 这些跟键、弧不是同一个对象。只藏它们，不写音符、不 hook 天键 tick。
+// 菱形残留不是路径没对上，是 hitLane 每帧被 ng+0x120 再次点亮。
+// seek 时截断输入/事件表，停掉 TrackBase+0x260 上的淡出，再藏 burst / hit_*.png。
 
 static bool s_fx_ptr(uint64_t v) {
     return v >= 0x100000000ULL && v < 0x7000000000ULL;
@@ -871,6 +868,37 @@ static int s_fx_hide_by_key(void *parent, uint64_t image_base, const char *key,
     return n;
 }
 
+static int s_fx_trunc_vec(void *obj, size_t off, size_t stride, size_t maxn) {
+    if (!s_fx_hp((uint64_t)obj) || !stride) return 0;
+    uint64_t b = 0, e = 0;
+    memcpy(&b, (char *)obj + off, 8);
+    memcpy(&e, (char *)obj + off + 8, 8);
+    if (!s_fx_hp(b) || !s_fx_hp(e) || e < b || ((e - b) % stride)) return 0;
+    size_t n = (e - b) / stride;
+    if (n > maxn) return 0;
+    memcpy((char *)obj + off + 8, &b, 8);
+    return (int)n;
+}
+
+static int s_fx_reset_lanehit(void *tb, uint64_t image_base) {
+    uint64_t b = 0, e = 0;
+    memcpy(&b, (char *)tb + XRC_TRACKBASE_LANEHIT_OFF, 8);
+    memcpy(&e, (char *)tb + XRC_TRACKBASE_LANEHIT_OFF + 8, 8);
+    if (!s_fx_hp(b) || !s_fx_hp(e) || e < b || ((e - b) % 8) || (e - b) / 8 > 16)
+        return 0;
+    void (*stop)(void *) = (void (*)(void *))(image_base + XRC_NODE_STOPALL_OFF);
+    int n = 0;
+    for (uint64_t p = b; p < e; p += 8) {
+        void *sp = NULL;
+        memcpy(&sp, (void *)p, 8);
+        if (!s_fx_hp((uint64_t)sp)) continue;
+        if (stop) stop(sp);
+        s_fx_hide(sp, image_base);
+        n++;
+    }
+    return n;
+}
+
 static int s_fx_hide_burst(void *burst, uint64_t image_base, char *sample, size_t sample_cap) {
     uint64_t pb = 0, pe = 0, cb = 0, ce = 0;
     memcpy(&pb, (char *)burst + XRC_NOTEBURST_PARTICLES_OFF, 8);
@@ -906,15 +934,22 @@ static void s_fx_purge_now(void) {
     void *scene = atomic_load(&xrc_gp_instance);
     if (!image_base || !s_fx_hp((uint64_t)scene)) return;
 
-    void *track = NULL, *ui = NULL;
+    void *track = NULL, *ui = NULL, *ng = NULL;
     memcpy(&track, (char *)scene + XRC_SCENE_TRACKLAYER_OFF, 8);
     memcpy(&ui, (char *)scene + XRC_SCENE_UILAYER_OFF, 8);
+    memcpy(&ng, (char *)scene + XRC_GP_NOTEGROUP_OFF, 8);
 
-    int lane = 0, burst = 0, hit = 0;
+    int lane = 0, burst = 0, hit = 0, hitq = 0, inp = 0, tlq = 0;
     char sample[192];
     sample[0] = 0;
 
+    if (s_fx_hp((uint64_t)ng)) {
+        inp = s_fx_trunc_vec(ng, XRC_NG_INPUT_BEGIN_OFF, 8, 64);
+        hitq = s_fx_trunc_vec(ng, XRC_NG_HITQ_BEGIN_OFF, XRC_NG_HITQ_STRIDE, 256);
+    }
+
     if (s_fx_vt(track, image_base, XRC_TRACKLAYER_VT_OFF)) {
+        tlq = s_fx_trunc_vec(track, XRC_TRACKLAYER_HITQ_OFF, XRC_NG_HITQ_STRIDE, 256);
         uint64_t b = 0, e = 0;
         memcpy(&b, (char *)track + XRC_TRACKLAYER_TRACKS_OFF, 8);
         memcpy(&e, (char *)track + XRC_TRACKLAYER_TRACKS_OFF + 8, 8);
@@ -923,7 +958,7 @@ static void s_fx_purge_now(void) {
                 void *tb = NULL;
                 memcpy(&tb, (void *)p, 8);
                 if (!s_fx_vt(tb, image_base, XRC_TRACKBASE_VT_OFF)) continue;
-                lane += s_fx_hide_by_key(tb, image_base, "lane_hit", sample, sizeof(sample));
+                lane += s_fx_reset_lanehit(tb, image_base);
             }
         }
         void *nb = NULL;
@@ -963,9 +998,10 @@ static void s_fx_purge_now(void) {
         }
     }
 
-    if (lane || burst || hit) {
-        xrc_logi(XRCLC_JUDGE, @"fx purge lane=%d burst=%d hit=%d sample=%s kids=%s",
-                 lane, burst, hit, sample[0] ? sample : "-", kids[0] ? kids : "-");
+    if (lane || burst || hit || hitq || inp || tlq) {
+        xrc_logi(XRCLC_JUDGE, @"fx purge lane=%d burst=%d hit=%d hitq=%d inp=%d tlq=%d sample=%s kids=%s",
+                 lane, burst, hit, hitq, inp, tlq,
+                 sample[0] ? sample : "-", kids[0] ? kids : "-");
     } else {
         static uint64_t s_fx_empty_us = 0;
         uint64_t now = xrc_real_now_us();
