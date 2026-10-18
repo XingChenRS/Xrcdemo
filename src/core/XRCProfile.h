@@ -40,6 +40,27 @@
 //   **场景初始化**函数（只跑一次），不代表每帧更新。
 #define XRC_NG_NOTEVEC_BEGIN_OFF   0xA0   // note group + 160：音符指针数组 begin
 #define XRC_NG_NOTEVEC_END_OFF     0xA8   // note group + 168：end
+#define XRC_NG_ALLNOTE_BEGIN_OFF   0x100  // 全谱表 begin（含 SceneControl）
+#define XRC_NG_ALLNOTE_END_OFF     0x108
+
+// scenecontrol 视野三元组（出处 research/notes/ios-7.0.255-05-enwiden-state-restore.md）
+// 分发器 case5/6 写一次，sub_10091BC44 每帧插值出 +96 / +116。
+// seek 后已消费的 enwidencamera/enwidenlanes 不会重放 ⇒ 必须按「最后一条 ≤T」写回。
+#define XRC_NG_CAM_T0_OFF          84     // i32 相机过渡起始 ms
+#define XRC_NG_CAM_DIR_OFF         88     // i32 方向：>0 走向 1.5，≤0 走向 1.0
+#define XRC_NG_CAM_DUR_OFF         92     // f32 时长 ms
+#define XRC_NG_CAM_PROGRESS_OFF    96     // f32 1.0..1.5，每帧重算
+#define XRC_NG_CAM_PREV_OFF        100    // f32 上一帧 progress
+#define XRC_NG_LANE_T0_OFF         104    // i32 轨道过渡起始 ms
+#define XRC_NG_LANE_DIR_OFF        108    // i32 方向：>0 → 6k，≤0 → 4k
+#define XRC_NG_LANE_DUR_OFF        112    // f32 时长 ms
+#define XRC_NG_LANE_PROGRESS_OFF   116    // f32 0..1，每帧重算
+#define XRC_SCN_TYPE_OFF           100    // LogicSceneControl：5=enwidencamera 6=enwidenlanes
+#define XRC_SCN_V1_OFF             104    // f32 时长
+#define XRC_SCN_V2_OFF             108    // u32 方向 1=开/延展 0=回
+#define XRC_SCN_TYPE_CAMERA        5
+#define XRC_SCN_TYPE_LANES         6
+#define XRC_SCN_BASELINE_T0        0xC0000000u  // ctor：float −2.0 的位型，当 i32 时间用
 
 // note 对象字段（外部参考实现 seek_to 的"重新武装"逐字 + 7.0 判定核交叉验证）
 //   +0x00 vtable（类型判据：Hold / Arc 各一）

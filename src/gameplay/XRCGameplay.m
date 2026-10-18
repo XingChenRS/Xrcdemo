@@ -29,6 +29,8 @@
 
 _Atomic(void *) xrc_gp_instance = NULL;
 
+extern void xrc_scn_restore(void *ng, uint32_t T);
+
 static void (*s_orig_gp_update)(void *, uint64_t, uint64_t, uint64_t, uint64_t) = NULL;
 static void *s_gp_last_clock = NULL;
 static uint64_t s_gp_last_real_us = 0;
@@ -173,7 +175,10 @@ static void xrc_clock_shift_to(void *note_group, int32_t target) {
     int32_t cur = xrc_chart_clock_ms(note_group);
     int32_t *base_off = (int32_t *)((char *)clk + XRC_CLK_BASE_OFF);
     *base_off = xrc_sat_add32(*base_off, xrc_sat_add32(cur, -target));
-    if (cur != target) xrc_preview_cull_arm();
+    if (cur != target) {
+        if (target >= 0) xrc_scn_restore(note_group, (uint32_t)target);
+        xrc_preview_cull_arm();
+    }
 }
 
 // 冻结窗收口（重建链末尾调用；时间兜底在 s_frz_tick）。

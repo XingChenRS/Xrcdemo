@@ -20,3 +20,7 @@ bool xrc_replay_enabled(void);
 // 与自动检出同一入口；P 取当前水位线（回跳前高水位），随后水位线消化到 T
 // ——防自动检出对同一次回跳再触发一遍。总门关闭/目标越界/场景无效时为无害空操作。
 void xrc_replay_request_reset(uint32_t T);
+
+// 按谱面重建 enwidencamera / enwidenlanes（ng+84..+116）。
+// 拖动、前跳、后跳、回跳都要走：否则 6k 段跳回 4k 仍是高相机或 6 轨。
+void xrc_scn_restore(void *ng, uint32_t T);

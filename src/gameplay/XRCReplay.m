@@ -78,6 +78,7 @@ static bool wr32(uint64_t addr, uint32_t v) {
                                 (vm_offset_t)&v, (mach_msg_type_number_t)sizeof(v));
     return kr == KERN_SUCCESS;
 }
+static bool rpf_wf(uint64_t addr, float v);
 
 static bool wr8(uint64_t addr, uint8_t v) {
     if (!addr) return false;
@@ -544,6 +545,155 @@ static int rpf_clear_buckets(uint64_t ng, uint32_t T) {
         }
     }
     return n;
+}
+
+// ---- scenecontrol 视野重建（enwidencamera=5 / enwidenlanes=6）----
+// 根因：这两条命令只在首次越过时写 ng+84..+112，消费位单向。seek 后远处事件
+// 进不了当帧窗口、已消费的也不会再派发 ⇒ 相机/轨数停在回跳前的值。
+// 4k↔6k 切换会重建 Track 外带层，顺带清掉判定面上的残留黑点；不还原轨道
+// 三元组，seek 就走不到那条刷新。
+// 做法：全谱表取 type 5/6「时间 ≤ T 的最后一条」，照分发器原样写回；无则 ctor 基线。
+// ≥T 的 5/6 清消费位，让播放头再次越过时自然重放。
+static float rpf_scn_progress(int32_t now, int32_t t0, int32_t dir, float dur, int camera) {
+    if (!(dur > 0.0001f)) dur = 1.f;
+    float v = ((float)now - (float)t0) / dur;
+    if (camera) {
+        v = (dir <= 0) ? (1.5f - v) : (1.0f + v);
+        if (v < 1.f) v = 1.f;
+        if (v > 1.5f) v = 1.5f;
+    } else {
+        if (dir <= 0) v = 1.f - v;
+        if (v < 0.f) v = 0.f;
+        if (v > 1.f) v = 1.f;
+    }
+    return v;
+}
+
+static void rpf_scn_write(uint64_t ng, int camera, int32_t t0, int32_t dir, float dur, int32_t now) {
+    uint64_t base = camera ? (ng + XRC_NG_CAM_T0_OFF) : (ng + XRC_NG_LANE_T0_OFF);
+    wr32(base, (uint32_t)t0);
+    wr32(base + 4, (uint32_t)dir);
+    rpf_wf(base + 8, dur);
+    float p = rpf_scn_progress(now, t0, dir, dur, camera);
+    if (camera) {
+        rpf_wf(ng + XRC_NG_CAM_PROGRESS_OFF, p);
+        rpf_wf(ng + XRC_NG_CAM_PREV_OFF, p);
+    } else {
+        rpf_wf(ng + XRC_NG_LANE_PROGRESS_OFF, p);
+    }
+}
+
+enum { RPF_SCN_MAX = 64 };
+static uint64_t s_scn_ng, s_scn_b, s_scn_e;
+static int s_scn_n, s_scn_all;
+static struct { int32_t t; uint32_t typ; int32_t dir; float dur; uint64_t obj; } s_scn_ev[RPF_SCN_MAX];
+
+static void rpf_scn_write_baseline(uint64_t ng, int32_t now) {
+    rpf_scn_write(ng, 1, (int32_t)XRC_SCN_BASELINE_T0, -1, 1.f, now);
+    rpf_scn_write(ng, 0, (int32_t)XRC_SCN_BASELINE_T0, -1, 1.f, now);
+}
+
+static int rpf_scn_collect(uint64_t ng) {
+    uint64_t b = 0, e = 0;
+    if (!rd(ng + XRC_NG_ALLNOTE_BEGIN_OFF, &b, 8) ||
+        !rd(ng + XRC_NG_ALLNOTE_END_OFF, &e, 8) ||
+        !s_ishp(b) || !s_ishp(e) || e < b || ((e - b) % 8)) return 0;
+    uint64_t n = (e - b) / 8;
+    if (n == 0 || n > 20000) return 0;
+    if (s_scn_ng == ng && s_scn_b == b && s_scn_e == e && s_scn_n >= 0) return 1;
+
+    s_scn_ng = ng;
+    s_scn_b = b;
+    s_scn_e = e;
+    s_scn_n = 0;
+    s_scn_all = 0;
+    for (uint64_t i = 0; i < n && s_scn_n < RPF_SCN_MAX; i++) {
+        uint64_t obj = 0, vt = 0;
+        if (!rd(b + 8 * i, &obj, 8) || !s_ishp(obj)) continue;
+        if (!rd(obj, &vt, 8) || !s_isptr(vt)) continue;
+        char nm[96];
+        rpf_class_name(vt, nm, sizeof(nm));
+        if (!strstr(nm, "SceneControl")) continue;
+        s_scn_all++;
+        uint32_t typ = 0;
+        int32_t t = 0, v2 = 0;
+        float v1 = 0.f;
+        if (!rd(obj + XRC_SCN_TYPE_OFF, &typ, 4)) continue;
+        if (typ != XRC_SCN_TYPE_CAMERA && typ != XRC_SCN_TYPE_LANES) continue;
+        if (!rd(obj + XRC_NOTE_TIME_OFF, &t, 4)) continue;
+        if (!rd(obj + XRC_SCN_V1_OFF, &v1, 4)) continue;
+        if (!rd(obj + XRC_SCN_V2_OFF, &v2, 4)) continue;
+        s_scn_ev[s_scn_n].t = t;
+        s_scn_ev[s_scn_n].typ = typ;
+        s_scn_ev[s_scn_n].dir = v2;
+        s_scn_ev[s_scn_n].dur = v1;
+        s_scn_ev[s_scn_n].obj = obj;
+        s_scn_n++;
+    }
+    return 1;
+}
+
+static void rpf_scn_restore(uint64_t ng, uint32_t T, int verbose) {
+    if (!s_ishp(ng)) return;
+    int32_t now = (int32_t)T;
+    if (!rpf_scn_collect(ng)) {
+        rpf_scn_write_baseline(ng, now);
+        if (verbose) xrc_logi(XRCLC_JUDGE, @"[rpf] scenecontrol scan-fail → baseline T=%u", T);
+        return;
+    }
+
+    struct { int32_t t; int32_t dir; float dur; int hit; } best[2];
+    memset(best, 0, sizeof(best));
+    best[0].t = best[1].t = (int32_t)0x80000000;
+    int nre = 0;
+
+    for (int i = 0; i < s_scn_n; i++) {
+        int32_t t = s_scn_ev[i].t;
+        int slot = (s_scn_ev[i].typ == XRC_SCN_TYPE_CAMERA) ? 0 : 1;
+        if ((int32_t)t - (int32_t)T <= 0 && t >= best[slot].t) {
+            best[slot].t = t;
+            best[slot].dir = s_scn_ev[i].dir;
+            best[slot].dur = s_scn_ev[i].dur;
+            best[slot].hit = 1;
+        }
+        if ((int32_t)t - (int32_t)T >= 0) {
+            uint64_t obj = s_scn_ev[i].obj;
+            uint8_t c0 = 0, c1 = 0;
+            rd(obj + 0x0C, &c0, 1);
+            rd(obj + 0x0D, &c1, 1);
+            if (c0) wr8(obj + 0x0C, 0);
+            if (c1) wr8(obj + 0x0D, 0);
+            nre++;
+        }
+    }
+
+    if (best[0].hit)
+        rpf_scn_write(ng, 1, best[0].t, best[0].dir, best[0].dur, now);
+    else
+        rpf_scn_write(ng, 1, (int32_t)XRC_SCN_BASELINE_T0, -1, 1.f, now);
+    if (best[1].hit)
+        rpf_scn_write(ng, 0, best[1].t, best[1].dir, best[1].dur, now);
+    else
+        rpf_scn_write(ng, 0, (int32_t)XRC_SCN_BASELINE_T0, -1, 1.f, now);
+
+    int32_t cam_t0 = 0, cam_dir = 0, lane_t0 = 0, lane_dir = 0;
+    float cam_p = 0.f, lane_p = 0.f;
+    rd(ng + XRC_NG_CAM_T0_OFF, &cam_t0, 4);
+    rd(ng + XRC_NG_CAM_DIR_OFF, &cam_dir, 4);
+    rd(ng + XRC_NG_CAM_PROGRESS_OFF, &cam_p, 4);
+    rd(ng + XRC_NG_LANE_T0_OFF, &lane_t0, 4);
+    rd(ng + XRC_NG_LANE_DIR_OFF, &lane_dir, 4);
+    rd(ng + XRC_NG_LANE_PROGRESS_OFF, &lane_p, 4);
+    if (verbose)
+        xrc_logi(XRCLC_JUDGE, @"[rpf] scenecontrol sc=%d ev=%d rearm=%d cam=%s t0=%d dir=%d p=%.3f lane=%s t0=%d dir=%d p=%.3f",
+                 s_scn_all, s_scn_n, nre,
+                 best[0].hit ? "event" : "base", cam_t0, cam_dir, cam_p,
+                 best[1].hit ? "event" : "base", lane_t0, lane_dir, lane_p);
+}
+
+void xrc_scn_restore(void *ng, uint32_t T) {
+    if (!ng) return;
+    rpf_scn_restore((uint64_t)ng, T, 0);
 }
 
 // 引擎登记函数原型（rpf_revive_main 直调 0x10091B6CC：按 [t0,te] 跨度把音符塞进每个位置槽）。
@@ -1329,6 +1479,8 @@ static void rpf_reset(uint64_t ng, uint32_t T, uint32_t P) {
         int nb = rpf_clear_buckets(ng, T);
         xrc_logd(XRCLC_JUDGE, @"[rpf] ⟲⟲⟲ 跳桶：清了 %d 个被隐藏的桶（桶时间 >= T）", nb);
     }
+
+    if (s_do_write) rpf_scn_restore(ng, T, 1);
 
     {
         int slots = 0, set = 0;
