@@ -53,7 +53,8 @@ bool xrc_gameplay_scrub(uint32_t ms);
 // 最近一次拖动落笔的真实时间（us）。XRCReplay 用它做检出豁免窗。
 uint64_t xrc_gameplay_scrub_us(void);
 
-// 前跳、后跳、拖动、循环回位、回跳重播都要裁预览残留。挪钟和重播入口调用。
+// 挪钟 / 回跳时清判定副产物（lane_hit、NoteBurst 闪光、hit_*.png）。
+// 不碰音符和弧。主线程立刻扫；其它线程只置位，下一帧 gp.update 再扫。
 void xrc_preview_cull_arm(void);
 
 // 是否处于对局中（场景活 + note 组 + 谱面钟三者齐备）。UI 用它区分菜单/对局。

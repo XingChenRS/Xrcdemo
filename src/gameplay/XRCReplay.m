@@ -1500,6 +1500,7 @@ static void rpf_reset_main(void *ctx) {
     if (!j) return;
     rpf_ap_latch_reset();          /* 先清闩，再走清洗/复活/重建 */
     rpf_reset(j->ng, j->T, j->P);
+    xrc_preview_cull_arm();        /* 清判定副产物，不碰音符 */
     /* 冻结窗收口。常规路径由**重建任务末尾**收口（它是链上最后一棒）；
        这里只兜「本帧不会有后续任务」的情形（重建未派发 且 复活也未派发）。 */
     {

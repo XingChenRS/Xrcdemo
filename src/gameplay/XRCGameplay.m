@@ -12,6 +12,9 @@
 #include <errno.h>
 #include <mach/vm_map.h>
 #include <mach/mach_init.h>
+#include <pthread.h>
+#include <string.h>
+#include <stdio.h>
 #include "XRCGameplay.h"
 #include "XRCRuntime.h"
 #include "XRCProbe.h"
@@ -170,7 +173,7 @@ static void xrc_clock_shift_to(void *note_group, int32_t target) {
     int32_t cur = xrc_chart_clock_ms(note_group);
     int32_t *base_off = (int32_t *)((char *)clk + XRC_CLK_BASE_OFF);
     *base_off = xrc_sat_add32(*base_off, xrc_sat_add32(cur, -target));
-    xrc_preview_cull_arm();
+    if (cur != target) xrc_preview_cull_arm();
 }
 
 // 冻结窗收口（重建链末尾调用；时间兜底在 s_frz_tick）。
@@ -684,20 +687,13 @@ static void s_rate_probe_tick(void *note_group) {
     last_us = now; last_chart = chart; last_chan = chan; have = 1;
 }
 
-static _Atomic(int) s_pv_latched = 0;
-static _Atomic(uint32_t) s_pv_hide_n = 0;
-static void *s_pv_ng = NULL;
-static bool s_pv_on(void);
-static void s_pv_sweep(void *ng);
+static _Atomic(int) s_fx_pend = 0;
+static void s_fx_purge_now(void);
 
 void xrc_gameplay_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     if (self) {
         atomic_store(&xrc_gp_instance, self);
         void *note_group = *(void **)((char *)self + XRC_GP_NOTEGROUP_OFF);
-        if (note_group != s_pv_ng) {
-            s_pv_ng = note_group;
-            atomic_store(&s_pv_latched, 0);
-        }
         if (note_group) {
             s_pause_tick(note_group);      // 暂停护栏（判定总闸/路过跳过/冻结看护）
             s_gp_retime_logic_clock(note_group);
@@ -755,39 +751,25 @@ void xrc_gameplay_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint
     // 放这里是因为 gp.update 是唯一"进对局后每帧都在跑"的点，面板不开时也有效。
     @try { xrc_audio_speed_tick(); } @catch (NSException *e) {}
     if (s_orig_gp_update) s_orig_gp_update(self, a2, a3, a4, a5);
-    if (s_pv_on()) {
-        void *ng = s_valid_note_group(self);
-        if (ng) s_pv_sweep(ng);
-        static uint64_t s_pv_log_us = 0;
-        uint64_t now = xrc_real_now_us();
-        if (now - s_pv_log_us > 1000000ULL) {
-            s_pv_log_us = now;
-            xrc_logi(XRCLC_JUDGE, @"arctap cull 本秒藏 %u 次", atomic_exchange(&s_pv_hide_n, 0));
-        }
-    }
+    if (atomic_exchange(&s_fx_pend, 0)) s_fx_purge_now();
 }
 
-// ---- 预览 ArcTap 裁剪 ----
-// 原生 tick 会把未消费的天键和地面阴影重新点亮。seek / 回跳之后，父弧逻辑
-// 往往还在活动窗口里，位置门也够不着，菱形就停在没有弧体、没有黑线的地方。
-// 已经挪过钟之后才查：父弧渲染对象下的弧体分段若一段都不可见，藏天键和阴影。
-// 分段还没建出来（读不到表）时不据此藏，避免弧刚入场的头一两帧被抹掉。
-// 没跳过钟的正常开局不进这里。不建处置表，不写弧端 cap。
-static void (*s_orig_arctap_tick)(void *) = NULL;
+// ---- 判定副产物清理 ----
+// 往回 seek / 回跳时，音符状态会被重置，但判定瞬间挂上的精灵不会：
+//   TrackBase 子节点 img/lane_hit.png（判定面上的菱形闪光）
+//   NoteBurstRenderer 里一次性 burst 子节点（打击闪光）
+//   UILayer 子节点 img/hit_pure.png / hit_far.png / hit_lost.png
+// 这些跟键、弧不是同一个对象。只藏它们，不写音符、不 hook 天键 tick。
 
-void xrc_preview_cull_arm(void) { atomic_store(&s_pv_latched, 1); }
-
-static bool s_pv_on(void) {
-    return atomic_load(&s_pv_latched)
-        || atomic_load(&s_practice_paused)
-        || atomic_load(&s_frz_state) != 0;
+static bool s_fx_ptr(uint64_t v) {
+    return v >= 0x100000000ULL && v < 0x7000000000ULL;
 }
 
-static bool s_pv_hp(uint64_t v) {
-    return v >= 0x100000000ULL && v < 0x7000000000ULL && (v & 7) == 0;
+static bool s_fx_hp(uint64_t v) {
+    return s_fx_ptr(v) && (v & 7) == 0;
 }
 
-static void *s_pv_strip(void *p) {
+static void *s_fx_strip(void *p) {
 #if __has_feature(ptrauth_calls)
     return ptrauth_strip(p, ptrauth_key_asia);
 #else
@@ -795,141 +777,210 @@ static void *s_pv_strip(void *p) {
 #endif
 }
 
-static void s_pv_hide(void *node) {
-    extern uint64_t xrc_image_base(void);
-    if (!s_pv_hp((uint64_t)node)) return;
+static bool s_fx_vt(void *obj, uint64_t image_base, uint64_t vt_off) {
+    if (!s_fx_hp((uint64_t)obj) || !image_base) return false;
     void *vt = NULL;
-    memcpy(&vt, node, 8);
-    if (!s_pv_hp((uint64_t)vt)) return;
+    memcpy(&vt, obj, 8);
+    return (uint64_t)s_fx_strip(vt) == image_base + vt_off;
+}
+
+static bool s_fx_slot(void *obj, uint64_t slot, uint64_t image_base,
+                     uint64_t expect, uint64_t alt, void **out) {
+    if (!s_fx_hp((uint64_t)obj) || !image_base) return false;
+    void *vt = NULL;
+    memcpy(&vt, obj, 8);
+    vt = s_fx_strip(vt);
+    if (!s_fx_hp((uint64_t)vt)) return false;
     void *fn = NULL;
-    memcpy(&fn, (char *)vt + XRC_NODE_SETVISIBLE_SLOT, 8);
-    uint64_t base = xrc_image_base();
-    if (!base || (uint64_t)s_pv_strip(fn) != base + XRC_NODE_SETVISIBLE_OFF) return;
-    ((void (*)(void *, bool))fn)(node, false);
+    memcpy(&fn, (char *)vt + slot, 8);
+    uint64_t raw = (uint64_t)s_fx_strip(fn);
+    if (raw != image_base + expect && (!alt || raw != image_base + alt)) return false;
+    if (out) *out = fn;
+    return true;
 }
 
-// 1 = 至少一段弧体可见；0 = 分段都不可见；-1 = 表还没建好或读不到，不据此藏。
-static int s_pv_arc_body(void *parent) {
-    void *rp = NULL, *node = NULL, *nvt = NULL, *get = NULL;
-    memcpy(&rp, (char *)parent + XRC_LOGIC_BACK_OFF, 8);
-    if (!s_pv_hp((uint64_t)rp)) return 0;
-    memcpy(&node, (char *)rp + XRC_ARC_SEG_CONTAINER_OFF, 8);
-    if (!s_pv_hp((uint64_t)node)) return -1;
-    memcpy(&nvt, node, 8);
-    if (!s_pv_hp((uint64_t)nvt)) return -1;
-    memcpy(&get, (char *)nvt + 544, 8);          // vt[68]，与回跳重显同一条
-    if (!s_pv_hp((uint64_t)get)) return -1;
-    void *list = ((void *(*)(void *))get)(node);
-    if (!s_pv_hp((uint64_t)list)) return -1;
+static void s_fx_hide(void *node, uint64_t image_base) {
+    void *vis = NULL, *op = NULL;
+    if (s_fx_slot(node, XRC_NODE_SETVISIBLE_SLOT, image_base,
+                  XRC_NODE_SETVISIBLE_OFF, XRC_NODE_SETVISIBLE_ALT_OFF, &vis))
+        ((void (*)(void *, bool))vis)(node, false);
+    if (s_fx_slot(node, XRC_NODE_SETOPACITY_SLOT, image_base,
+                  XRC_NODE_SETOPACITY_OFF, 0, &op))
+        ((void (*)(void *, unsigned char))op)(node, 0);
+}
+
+static bool s_fx_children(void *node, uint64_t *b, uint64_t *e, uint64_t maxn) {
+    void *vec = NULL;
+    memcpy(&vec, (char *)node + XRC_NODE_CHILDREN_OFF, 8);
+    if (!s_fx_hp((uint64_t)vec)) return false;
+    uint64_t begin = 0, end = 0;
+    memcpy(&begin, vec, 8);
+    memcpy(&end, (char *)vec + 8, 8);
+    if (!s_fx_hp(begin) || !s_fx_hp(end) || end < begin || ((end - begin) % 8)) return false;
+    if ((end - begin) / 8 > maxn) return false;
+    *b = begin;
+    *e = end;
+    return true;
+}
+
+static bool s_fx_path(void *node, uint64_t image_base, char *out, size_t cap) {
+    if (!out || cap < 2 || !s_fx_vt(node, image_base, XRC_SPRITE_VT_OFF)) return false;
+    unsigned char raw[24];
+    memcpy(raw, (char *)node + XRC_SPRITE_PATH_OFF, 24);
+    size_t n = raw[23];
+    const char *p = (const char *)((char *)node + XRC_SPRITE_PATH_OFF);
+    if (raw[23] & 0x80) {
+        memcpy(&p, raw, 8);
+        memcpy(&n, raw + 8, 8);
+        if (!p || n > 191 || !s_fx_ptr((uint64_t)p)) return false;
+    } else if (n > 22) {
+        return false;
+    }
+    if (n >= cap) n = cap - 1;
+    if (n) memcpy(out, p, n);
+    out[n] = 0;
+    for (size_t i = 0; i < n; i++) if (!out[i]) return false;
+    return n > 0;
+}
+
+static bool s_fx_path_has(void *node, uint64_t image_base, const char *key) {
+    char path[192];
+    if (!s_fx_path(node, image_base, path, sizeof(path))) return false;
+    return strstr(path, key) != NULL;
+}
+
+static int s_fx_hide_by_key(void *parent, uint64_t image_base, const char *key,
+                            char *sample, size_t sample_cap) {
     uint64_t b = 0, e = 0;
-    memcpy(&b, list, 8);
-    memcpy(&e, (char *)list + 8, 8);
-    if (!s_pv_hp(b) || !s_pv_hp(e) || e < b || (e - b) > 0x4000 || ((e - b) % 8)) return -1;
-    uint64_t n = (e - b) / 8;
-    if (n == 0) return -1;
-    int seen = 0;
-    if (n > 64) n = 64;
-    for (uint64_t i = 0; i < n; i++) {
-        void *child = NULL, *cvt = NULL, *vis = NULL;
-        memcpy(&child, (void *)(b + i * 8), 8);
-        if (!s_pv_hp((uint64_t)child)) continue;
-        memcpy(&cvt, child, 8);
-        if (!s_pv_hp((uint64_t)cvt)) continue;
-        memcpy(&vis, (char *)cvt + 0x158, 8);    // Node::isVisible，槽 43
-        if (!s_pv_hp((uint64_t)vis)) continue;
-        seen++;
-        if (((unsigned (*)(void *))vis)(child)) return 1;
+    if (!s_fx_children(parent, &b, &e, 256)) return 0;
+    int n = 0;
+    for (uint64_t p = b; p < e; p += 8) {
+        void *child = NULL;
+        memcpy(&child, (void *)p, 8);
+        if (!s_fx_path_has(child, image_base, key)) continue;
+        s_fx_hide(child, image_base);
+        n++;
+        if (sample && sample_cap && !sample[0])
+            s_fx_path(child, image_base, sample, sample_cap);
     }
-    return seen ? 0 : -1;
+    return n;
 }
 
-static bool s_pv_parent_live(void *ng, void *parent) {
-    uint64_t b = 0, e = 0;
-    memcpy(&b, (char *)ng + XRC_NG_NOTEVEC_BEGIN_OFF, 8);
-    memcpy(&e, (char *)ng + XRC_NG_NOTEVEC_BEGIN_OFF + 8, 8);
-    if (!s_pv_hp(b) || !s_pv_hp(e) || e < b) return false;
-    uint64_t n = (e - b) / 8;
-    if (n == 0 || n > 8192) return false;
-    for (uint64_t i = 0; i < n; i++) {
-        void *slot = NULL;
-        memcpy(&slot, (void *)(b + i * 8), 8);
-        if (slot == parent) return true;
+static int s_fx_hide_burst(void *burst, uint64_t image_base, char *sample, size_t sample_cap) {
+    uint64_t pb = 0, pe = 0, cb = 0, ce = 0;
+    memcpy(&pb, (char *)burst + XRC_NOTEBURST_PARTICLES_OFF, 8);
+    memcpy(&pe, (char *)burst + XRC_NOTEBURST_PARTICLES_OFF + 8, 8);
+    if (pb && (!s_fx_hp(pb) || !s_fx_hp(pe) || pe < pb || ((pe - pb) % 8) || (pe - pb) / 8 > 16))
+        return 0;
+    if (!s_fx_children(burst, &cb, &ce, 256)) return 0;
+    int n = 0;
+    for (uint64_t p = cb; p < ce; p += 8) {
+        void *child = NULL;
+        memcpy(&child, (void *)p, 8);
+        if (!s_fx_hp((uint64_t)child)) continue;
+        bool keep = false;
+        if (pb && pe > pb) {
+            for (uint64_t q = pb; q < pe; q += 8) {
+                void *part = NULL;
+                memcpy(&part, (void *)q, 8);
+                if (part == child) { keep = true; break; }
+            }
+        }
+        if (keep) continue;
+        s_fx_hide(child, image_base);
+        n++;
+        if (sample && sample_cap && !sample[0])
+            s_fx_path(child, image_base, sample, sample_cap);
     }
-    return false;
+    return n;
 }
 
-static void s_pv_apply(void *render, void *ng) {
-    if (!s_pv_hp((uint64_t)render) || !ng) return;
-    void *logic = NULL;
-    memcpy(&logic, (char *)render + XRC_ARCTAP_LOGIC_OFF, 8);
-    if (!s_pv_hp((uint64_t)logic)) return;
-    void *back = NULL;
-    memcpy(&back, (char *)logic + XRC_LOGIC_BACK_OFF, 8);
-    if (back != render) return;
-
-    void *parent = NULL;
-    memcpy(&parent, (char *)logic + XRC_ARCTAP_PARENT_OFF, 8);
-    int body = s_pv_hp((uint64_t)parent) ? s_pv_arc_body(parent) : 0;
-    bool live = body != 0 && s_pv_hp((uint64_t)parent) && s_pv_parent_live(ng, parent);
-    int32_t position = 0, tail = 0, head = 0;
-    if (live) {
-        memcpy(&position, (char *)logic + 0x30, 4);
-        memcpy(&tail, (char *)logic + 0x34, 4);
-        memcpy(&head, (char *)logic + 0x18, 4);
-    }
-    int32_t clock = xrc_chart_clock_ms(ng);
-    // body==0：弧体一段都不可见，菱形不该留。body==1：弧还在，不动。
-    // body<0：分段表读不到，退回原来的窗口/位置门。
-    bool hide = body == 0 || (body < 0 && (
-        !live || position <= -9000 || (clock >= 0 && tail >= 301 && head <= clock)));
-    if (!hide) return;
-    atomic_fetch_add(&s_pv_hide_n, 1);
-    s_pv_hide(render);
-    void *shadow = NULL;
-    memcpy(&shadow, (char *)render + XRC_ARCTAP_SHADOW_OFF, 8);
-    if (shadow != render) s_pv_hide(shadow);
-}
-
-static void s_pv_sweep(void *ng) {
+static void s_fx_purge_now(void) {
     extern uint64_t xrc_image_base(void);
-    uint64_t base = xrc_image_base();
-    uint64_t b = 0, e = 0;
-    if (!base) return;
-    memcpy(&b, (char *)ng + 0x100, 8);
-    memcpy(&e, (char *)ng + 0x108, 8);
-    if (!s_pv_hp(b) || !s_pv_hp(e) || e < b) return;
-    uint64_t n = (e - b) / 8;
-    if (n == 0 || n > 20000) return;
-    for (uint64_t i = 0; i < n; i++) {
-        void *note = NULL, *render = NULL, *vt = NULL;
-        memcpy(&note, (void *)(b + i * 8), 8);
-        if (!s_pv_hp((uint64_t)note)) continue;
-        memcpy(&render, (char *)note + XRC_LOGIC_BACK_OFF, 8);
-        if (!s_pv_hp((uint64_t)render)) continue;
-        memcpy(&vt, render, 8);
-        if ((uint64_t)s_pv_strip(vt) != base + XRC_ARCTAP_VT_OFF) continue;
-        s_pv_apply(render, ng);
+    uint64_t image_base = xrc_image_base();
+    void *scene = atomic_load(&xrc_gp_instance);
+    if (!image_base || !s_fx_hp((uint64_t)scene)) return;
+
+    void *track = NULL, *ui = NULL;
+    memcpy(&track, (char *)scene + XRC_SCENE_TRACKLAYER_OFF, 8);
+    memcpy(&ui, (char *)scene + XRC_SCENE_UILAYER_OFF, 8);
+
+    int lane = 0, burst = 0, hit = 0;
+    char sample[192];
+    sample[0] = 0;
+
+    if (s_fx_vt(track, image_base, XRC_TRACKLAYER_VT_OFF)) {
+        uint64_t b = 0, e = 0;
+        memcpy(&b, (char *)track + XRC_TRACKLAYER_TRACKS_OFF, 8);
+        memcpy(&e, (char *)track + XRC_TRACKLAYER_TRACKS_OFF + 8, 8);
+        if (s_fx_hp(b) && s_fx_hp(e) && e >= b && ((e - b) % 8) == 0 && (e - b) / 8 <= 8) {
+            for (uint64_t p = b; p < e; p += 8) {
+                void *tb = NULL;
+                memcpy(&tb, (void *)p, 8);
+                if (!s_fx_vt(tb, image_base, XRC_TRACKBASE_VT_OFF)) continue;
+                lane += s_fx_hide_by_key(tb, image_base, "lane_hit", sample, sizeof(sample));
+            }
+        }
+        void *nb = NULL;
+        memcpy(&nb, (char *)track + XRC_TRACKLAYER_BURST_OFF, 8);
+        if (s_fx_vt(nb, image_base, XRC_NOTEBURST_VT_OFF))
+            burst = s_fx_hide_burst(nb, image_base, sample, sizeof(sample));
+    }
+    if (s_fx_vt(ui, image_base, XRC_UILAYER_VT_OFF)) {
+        hit += s_fx_hide_by_key(ui, image_base, "hit_pure", sample, sizeof(sample));
+        hit += s_fx_hide_by_key(ui, image_base, "hit_far", sample, sizeof(sample));
+        hit += s_fx_hide_by_key(ui, image_base, "hit_lost", sample, sizeof(sample));
+    }
+
+    char kids[240];
+    kids[0] = 0;
+    if (s_fx_vt(track, image_base, XRC_TRACKLAYER_VT_OFF)) {
+        uint64_t b = 0, e = 0;
+        memcpy(&b, (char *)track + XRC_TRACKLAYER_TRACKS_OFF, 8);
+        memcpy(&e, (char *)track + XRC_TRACKLAYER_TRACKS_OFF + 8, 8);
+        if (s_fx_hp(b) && s_fx_hp(e) && e > b && (e - b) / 8 <= 8) {
+            void *tb0 = NULL;
+            memcpy(&tb0, (void *)b, 8);
+            uint64_t cb = 0, ce = 0;
+            if (s_fx_children(tb0, &cb, &ce, 256)) {
+                int nk = 0, off = 0;
+                for (uint64_t p = cb; p < ce && nk < 6; p += 8) {
+                    void *child = NULL;
+                    char path[96];
+                    memcpy(&child, (void *)p, 8);
+                    if (!s_fx_path(child, image_base, path, sizeof(path))) continue;
+                    off += snprintf(kids + off, sizeof(kids) - (size_t)off, "%s%s",
+                                    nk ? "," : "", path);
+                    nk++;
+                    if (off >= (int)sizeof(kids) - 8) break;
+                }
+            }
+        }
+    }
+
+    if (lane || burst || hit) {
+        xrc_logi(XRCLC_JUDGE, @"fx purge lane=%d burst=%d hit=%d sample=%s kids=%s",
+                 lane, burst, hit, sample[0] ? sample : "-", kids[0] ? kids : "-");
+    } else {
+        static uint64_t s_fx_empty_us = 0;
+        uint64_t now = xrc_real_now_us();
+        if (now - s_fx_empty_us > 1000000ULL) {
+            s_fx_empty_us = now;
+            xrc_logi(XRCLC_JUDGE, @"fx purge 0（track=%d ui=%d）kids=%s",
+                     s_fx_vt(track, image_base, XRC_TRACKLAYER_VT_OFF),
+                     s_fx_vt(ui, image_base, XRC_UILAYER_VT_OFF),
+                     kids[0] ? kids : "-");
+        }
     }
 }
 
-static void s_arctap_tick(void *self) {
-    if (s_orig_arctap_tick) s_orig_arctap_tick(self);
-    if (!s_pv_on()) return;
-    void *scene = atomic_load(&xrc_gp_instance);
-    s_pv_apply(self, s_valid_note_group(scene));
-}
-
-static void s_install_arctap_cull(uint64_t image_base) {
-    int slot = xrc_swizzle_vtable(image_base + XRC_ARCTAP_VT_OFF,
-                                  XRC_ARCTAP_TICK_OFF,
-                                  (void *)s_arctap_tick,
-                                  (void **)&s_orig_arctap_tick);
-    if (slot == INT_MIN || !s_orig_arctap_tick) {
-        s_orig_arctap_tick = NULL;
-        xrc_logd(XRCLC_JUDGE, @"arctap preview cull skipped: tick slot missing");
+void xrc_preview_cull_arm(void) {
+    if (pthread_main_np()) {
+        atomic_store(&s_fx_pend, 0);
+        s_fx_purge_now();
         return;
     }
-        xrc_logi(XRCLC_JUDGE, @"arctap preview cull installed slot=%d", slot);
+    atomic_store(&s_fx_pend, 1);
 }
 
 void xrc_gameplay_install_hooks(uint64_t image_base) {
@@ -945,8 +996,7 @@ void xrc_gameplay_install_hooks(uint64_t image_base) {
                                           (void **)&s_orig_gp_update);
             if (slot != INT_MIN) xrc_logd(XRCLC_JUDGE, @"gp.update vtable installed slot=%d", slot);
         }
-        uint64_t base = image_base ? image_base : g_xrc.image_base;
-        if (base) s_install_arctap_cull(base);
+        (void)image_base;
     });
 }
 

@@ -513,19 +513,34 @@
 #define XRC_ARC_IND_QUAD2_OFF       0x3CC
 #define XRC_ARC_IND_QUAD3_OFF       0x3E4
 
-// ---------------- 预览 ArcTap 裁剪（回跳黑点）----------------
-// 出处：research/notes/ios-7.0.255-04-arc-indicator-seek.md §2.3（同一镜像，
-//       官包 Arc-mobile sha256 5be475c6…）；判据与 UIP AUPPreviewVisualPolicy 一致。
-// 只在预览（练习暂停 / 冻结窗）里、原生 tick 返回之后做。不写弧端 cap，
-// 不保留处置表。父弧不在活动窗口时位置是陈旧值，只认身份。
-#define XRC_ARCTAP_VT_OFF        0x14B03E8ULL  // off_1014B03E8，RenderArcTapNote 虚表槽 0
-#define XRC_ARCTAP_TICK_OFF      0x8A4284ULL   // sub_1008A4284，虚表槽 162
-#define XRC_NODE_SETVISIBLE_OFF  0xE6BCD8ULL   // sub_100E6BCD8，Node::setVisible，槽 +0x150
-#define XRC_NODE_SETVISIBLE_SLOT 0x150
-#define XRC_ARCTAP_LOGIC_OFF     0x268         // RenderArcTapNote → LogicArcTapNote
-#define XRC_ARCTAP_SHADOW_OFF    0x290         // 本类的 white.png 阴影，不是 ArcSegment 指示器，也不是弧端 cap
-#define XRC_LOGIC_BACK_OFF       0x40          // 逻辑音符 → 自己的渲染对象
-#define XRC_ARCTAP_PARENT_OFF    0x90          // 天键逻辑 → 父弧 LogicArcNote
+// ---------------- 判定副产物（seek / 回跳残留）----------------
+// 菱形浅色阴影不是 LogicNote / RenderNote，是判定瞬间挂上的一次性精灵。
+// 出处：
+//   · 官包 7.0.255：TrackLayer::visit 末尾 visit NoteBurst；命中链
+//     sub_100CA7538 → sub_100B2425C → sub_100A74C14 把 burst 子节点
+//     addChild 到 trackLayer+736；sub_100BAD9BC 把 hit_*.png addChild
+//     到 scene+896（UILayer）。
+//   · UIP AUPGlobalGameBridge：HideHit 认的就是 TrackBase 子节点
+//     img/lane_hit.png、NoteBurstRenderer visit、以及
+//     img/hit_pure.png / hit_far.png / hit_lost.png。
+// 只在挪钟 / 回跳重置时藏这些精灵，不碰音符、弧、天键。
+#define XRC_SCENE_TRACKLAYER_OFF     880          // scene+880 = TrackLayer（RPF_RENDERMGR）
+#define XRC_SCENE_UILAYER_OFF        896          // scene+896 = UILayer / 判定特效管理器
+#define XRC_TRACKLAYER_TRACKS_OFF    0x2C0        // 嵌入 vector<TrackBase*>，UIP 同偏移
+#define XRC_TRACKLAYER_BURST_OFF     736          // NoteBurstRenderer*
+#define XRC_NOTEBURST_PARTICLES_OFF  624          // 嵌入 vector<ParticleSystem*>，长条粒子，勿藏
+#define XRC_NODE_CHILDREN_OFF        0x140        // 间接 Vector*（UIP Node visit 同布局）
+#define XRC_SPRITE_PATH_OFF          0x450        // cocos2d::Sprite 文件名，Apple libc++ 短串
+#define XRC_TRACKLAYER_VT_OFF        0x14EDB68ULL // 地址点，UIP TrackLayerVT
+#define XRC_TRACKBASE_VT_OFF         0x14E37B8ULL // 地址点，UIP TrackVT
+#define XRC_NOTEBURST_VT_OFF         0x14D7C80ULL // 地址点，_ZTV17NoteBurstRenderer+0x10
+#define XRC_UILAYER_VT_OFF           0x14FAFD0ULL // 地址点，UIP UIVT
+#define XRC_SPRITE_VT_OFF            0x1545268ULL // 地址点，UIP SpriteVT
+#define XRC_NODE_SETVISIBLE_OFF      0xE6BCD8ULL  // sub_100E6BCD8，Node::setVisible，槽 +0x150
+#define XRC_NODE_SETVISIBLE_SLOT     0x150
+#define XRC_NODE_SETVISIBLE_ALT_OFF  0xECD0C8ULL  // UIP 接受的另一套 setVisible
+#define XRC_NODE_SETOPACITY_OFF      0xE6E338ULL  // sub_100E6E338，槽 +0x470
+#define XRC_NODE_SETOPACITY_SLOT     0x470
 
 // ---------------- OnlineManager 探针 / applog 强发（XRCOMLog）----------------
 // 出处: 真机内存转储 + 静态复核。
